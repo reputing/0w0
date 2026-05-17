@@ -1,42 +1,43 @@
 """
 Scythe — Supabase DB client
-Shared across all Vercel API functions.
-Uses asyncpg for async PostgreSQL connections.
+Uses asyncpg with per-request connections (no global pool) to avoid
+event loop issues in Vercel's threaded serverless environment.
 """
 import os
 import asyncpg
-import json
 
 DATABASE_URL = os.environ["SUPABASE_DB_URL"]
-# Format: postgresql://postgres:[password]@db.[ref].supabase.co:5432/postgres
 
-_pool = None
-
-async def get_pool():
-    global _pool
-    if _pool is None:
-        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-    return _pool
+async def _connect():
+    return await asyncpg.connect(DATABASE_URL)
 
 async def fetchone(query: str, *args):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    conn = await _connect()
+    try:
         return await conn.fetchrow(query, *args)
+    finally:
+        await conn.close()
 
 async def fetchall(query: str, *args):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    conn = await _connect()
+    try:
         return await conn.fetch(query, *args)
+    finally:
+        await conn.close()
 
 async def execute(query: str, *args):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    conn = await _connect()
+    try:
         return await conn.execute(query, *args)
+    finally:
+        await conn.close()
 
 async def fetchval(query: str, *args):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    conn = await _connect()
+    try:
         return await conn.fetchval(query, *args)
+    finally:
+        await conn.close()
 
 # ── User helpers ──────────────────────────────────────────────────────────────
 
@@ -106,7 +107,6 @@ async def get_leaderboard(beatmap_md5: str, limit=50,
             ORDER BY s.pp DESC LIMIT $2
         """, beatmap_md5, limit)
 
-    # Ghost score
     ghost = None
     if requesting_user_id:
         user_ids = [r["user_id"] for r in rows]
@@ -125,9 +125,7 @@ async def flag_score_db(score_id: int, reason: str):
     await execute("UPDATE scores SET ac_flagged=TRUE, ac_flag_reason=$1 WHERE id=$2",
                   reason, score_id)
     if row:
-        await execute("""
-            UPDATE users SET status=2 WHERE id=$1 AND status=0
-        """, row["user_id"])
+        await execute("UPDATE users SET status=2 WHERE id=$1 AND status=0", row["user_id"])
         await execute("""
             INSERT INTO ac_log (user_id, score_id, flag_type, flag_detail, action_taken)
             VALUES ($1,$2,'auto',$3,'shadowban')
@@ -138,10 +136,7 @@ async def flag_score_db(score_id: int, reason: str):
 async def get_or_create_beatmap(md5: str):
     row = await fetchone("SELECT * FROM beatmaps WHERE md5=$1", md5)
     if not row:
-        await execute("""
-            INSERT INTO beatmaps (md5, status) VALUES ($1, 5)
-            ON CONFLICT DO NOTHING
-        """, md5)
+        await execute("INSERT INTO beatmaps (md5, status) VALUES ($1, 5) ON CONFLICT DO NOTHING", md5)
         row = await fetchone("SELECT * FROM beatmaps WHERE md5=$1", md5)
     return row
 
@@ -164,7 +159,6 @@ async def set_featured_map(beatmap_md5: str):
     import datetime
     today = datetime.date.today().isoformat()
     await execute("""
-        INSERT INTO featured_map (id, beatmap_md5, date)
-        VALUES (1,$1,$2)
+        INSERT INTO featured_map (id, beatmap_md5, date) VALUES (1,$1,$2)
         ON CONFLICT (id) DO UPDATE SET beatmap_md5=$1, date=$2
     """, beatmap_md5, today)
