@@ -1,7 +1,8 @@
 {
   "version": 2,
   "builds": [
-    { "src": "api/*.py", "use": "@vercel/python" }
+    { "src": "api/*.py", "use": "@vercel/python" },
+    { "src": "public/**", "use": "@vercel/static" }
   ],
   "routes": [
     { "src": "/web/osu-submit-modular-selector.php", "dest": "/api/osu-submit-modular-selector.py" },
@@ -10,6 +11,7 @@
     { "src": "/admin(.*)",                            "dest": "/api/admin.py" },
     { "src": "/api/v1/(.*)",                          "dest": "/api/misc.py" },
     { "src": "/u/(.*)",                               "dest": "/api/misc.py" },
+    { "src": "/",                                     "dest": "/public/index.html" },
     { "src": "/(.*)",                                 "dest": "/api/misc.py" }
   ]
 }
