@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Scythe — osu! Private Server</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=DM+Sans:wght@200;300;400;500&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #0a0a0a;
+    --fg: #f0f0f0;
+    --mid: #888;
+    --border: #1e1e1e;
+    --card: #111;
+    --mono: 'DM Mono', monospace;
+    --sans: 'DM Sans', sans-serif;
+  }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--sans);
+    font-weight: 300;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* ── Noise texture overlay ── */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.04'/%3E%3C/svg%3E");
+    pointer-events: none;
+    z-index: 999;
+    opacity: 0.4;
+  }
+
+  /* ── Nav ── */
+  nav {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 20px 40px;
+    background: rgba(10,10,10,0.85);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .nav-logo {
+    font-family: var(--mono);
+    font-size: 14px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--fg);
+    text-decoration: none;
+  }
+
+  .nav-links {
+    display: flex;
+    gap: 32px;
+    list-style: none;
+  }
+
+  .nav-links a {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--mid);
+    text-decoration: none;
+    transition: color 0.2s;
+  }
+
+  .nav-links a:hover { color: var(--fg); }
+
+  /* ── Hero ── */
+  .hero {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    padding: 120px 40px 80px;
+    border-bottom: 1px solid var(--border);
+    position: relative;
+  }
+
+  .hero-label {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+    color: var(--mid);
+    margin-bottom: 32px;
+  }
+
+  .hero-title {
+    font-size: clamp(56px, 10vw, 120px);
+    font-weight: 200;
+    line-height: 0.95;
+    letter-spacing: -0.03em;
+    margin-bottom: 40px;
+  }
+
+  .hero-title em {
+    font-style: normal;
+    color: var(--mid);
+  }
+
+  .hero-sub {
+    font-size: 15px;
+    color: var(--mid);
+    max-width: 420px;
+    line-height: 1.7;
+    margin-bottom: 56px;
+  }
+
+  .hero-actions {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+
+  .btn {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    padding: 14px 28px;
+    border: 1px solid var(--fg);
+    background: transparent;
+    color: var(--fg);
+    cursor: pointer;
+    text-decoration: none;
+    transition: all 0.2s;
+    display: inline-block;
+  }
+
+  .btn:hover {
+    background: var(--fg);
+    color: var(--bg);
+  }
+
+  .btn-ghost {
+    border-color: var(--border);
+    color: var(--mid);
+  }
+
+  .btn-ghost:hover {
+    border-color: var(--fg);
+    background: transparent;
+    color: var(--fg);
+  }
+
+  .hero-stats {
+    position: absolute;
+    bottom: 40px;
+    right: 40px;
+    display: flex;
+    gap: 48px;
+  }
+
+  .stat {
+    text-align: right;
+  }
+
+  .stat-val {
+    font-family: var(--mono);
+    font-size: 28px;
+    font-weight: 400;
+    display: block;
+    line-height: 1;
+    margin-bottom: 6px;
+  }
+
+  .stat-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--mid);
+  }
+
+  /* ── Sections ── */
+  section {
+    padding: 80px 40px;
+    border-bottom: 1px solid var(--border);
+    max-width: 1100px;
+    margin: 0 auto;
+  }
+
+  .section-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+    color: var(--mid);
+    margin-bottom: 48px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .section-label::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+
+  /* ── Features grid ── */
+  .features {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+  }
+
+  .feature {
+    background: var(--bg);
+    padding: 32px;
+    transition: background 0.2s;
+  }
+
+  .feature:hover { background: var(--card); }
+
+  .feature-icon {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--mid);
+    margin-bottom: 20px;
+    letter-spacing: 0.1em;
+  }
+
+  .feature-title {
+    font-size: 15px;
+    font-weight: 400;
+    margin-bottom: 10px;
+    letter-spacing: -0.01em;
+  }
+
+  .feature-desc {
+    font-size: 13px;
+    color: var(--mid);
+    line-height: 1.6;
+  }
+
+  /* ── Connect section ── */
+  .connect-steps {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    border: 1px solid var(--border);
+  }
+
+  .step {
+    display: grid;
+    grid-template-columns: 60px 1fr;
+    gap: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .step:last-child { border-bottom: none; }
+
+  .step-num {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--mid);
+    padding: 28px 24px;
+    border-right: 1px solid var(--border);
+    display: flex;
+    align-items: flex-start;
+    padding-top: 30px;
+  }
+
+  .step-content {
+    padding: 28px 32px;
+  }
+
+  .step-title {
+    font-size: 14px;
+    font-weight: 400;
+    margin-bottom: 8px;
+  }
+
+  .step-desc {
+    font-size: 13px;
+    color: var(--mid);
+    line-height: 1.6;
+    margin-bottom: 12px;
+  }
+
+  .code {
+    font-family: var(--mono);
+    font-size: 12px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    padding: 12px 16px;
+    color: var(--fg);
+    display: inline-block;
+    cursor: pointer;
+    transition: border-color 0.2s;
+    position: relative;
+    word-break: break-all;
+  }
+
+  .code:hover { border-color: var(--mid); }
+
+  .code .copy-hint {
+    font-size: 10px;
+    color: var(--mid);
+    margin-left: 12px;
+    letter-spacing: 0.1em;
+  }
+
+  .code.copied { border-color: var(--fg); }
+
+  /* ── Register form ── */
+  .register-wrap {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 80px;
+    align-items: start;
+  }
+
+  .register-info h2 {
+    font-size: 36px;
+    font-weight: 200;
+    letter-spacing: -0.02em;
+    line-height: 1.2;
+    margin-bottom: 20px;
+  }
+
+  .register-info p {
+    font-size: 13px;
+    color: var(--mid);
+    line-height: 1.7;
+  }
+
+  .form {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    border: 1px solid var(--border);
+  }
+
+  .field {
+    display: flex;
+    flex-direction: column;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .field:last-of-type { border-bottom: none; }
+
+  .field label {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--mid);
+    padding: 16px 20px 0;
+  }
+
+  .field input {
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--fg);
+    font-family: var(--sans);
+    font-size: 14px;
+    font-weight: 300;
+    padding: 8px 20px 16px;
+    width: 100%;
+  }
+
+  .field input::placeholder { color: #333; }
+
+  .form-submit {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    padding: 18px 28px;
+    border: none;
+    border-top: 1px solid var(--border);
+    background: var(--fg);
+    color: var(--bg);
+    cursor: pointer;
+    width: 100%;
+    transition: opacity 0.2s;
+    font-weight: 500;
+  }
+
+  .form-submit:hover { opacity: 0.85; }
+  .form-submit:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .form-msg {
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 14px 20px;
+    border-top: 1px solid var(--border);
+    display: none;
+  }
+
+  .form-msg.error { color: #ff6b6b; display: block; animation: msgpop 0.25s ease; }
+  .form-msg.success { color: #aaffaa; display: block; animation: msgpop 0.25s ease; }
+
+  @keyframes msgpop {
+    from { opacity: 0; transform: translateY(-4px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  /* ── Leaderboard ── */
+  .lb-table {
+    width: 100%;
+    border: 1px solid var(--border);
+    border-collapse: collapse;
+  }
+
+  .lb-table th {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--mid);
+    padding: 14px 20px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+    font-weight: 400;
+  }
+
+  .lb-table td {
+    padding: 14px 20px;
+    font-size: 13px;
+    border-bottom: 1px solid var(--border);
+    font-family: var(--mono);
+  }
+
+  .lb-table tr:last-child td { border-bottom: none; }
+
+  .lb-table tr:hover td { background: var(--card); }
+
+  .lb-rank { color: var(--mid); width: 50px; }
+  .lb-name { color: var(--fg); font-weight: 500; }
+  .lb-pp   { color: var(--fg); text-align: right; }
+  .lb-acc  { color: var(--mid); text-align: right; }
+  .lb-pc   { color: var(--mid); text-align: right; }
+
+  .lb-loading {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--mid);
+    padding: 40px 20px;
+    text-align: center;
+  }
+
+  /* ── Footer ── */
+  footer {
+    padding: 40px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    max-width: 1100px;
+    margin: 0 auto;
+  }
+
+  footer span {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--mid);
+    letter-spacing: 0.1em;
+  }
+
+  /* ── Animations ── */
+  @keyframes fadein {
+    from { opacity: 0; transform: translateY(16px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .hero-label, .hero-title, .hero-sub, .hero-actions {
+    animation: fadein 0.7s ease both;
+  }
+  .hero-label  { animation-delay: 0.0s; }
+  .hero-title  { animation-delay: 0.1s; }
+  .hero-sub    { animation-delay: 0.2s; }
+  .hero-actions{ animation-delay: 0.3s; }
+
+  /* ── Responsive ── */
+  @media (max-width: 768px) {
+    nav { padding: 16px 20px; }
+    .nav-links { gap: 20px; }
+    .hero { padding: 100px 20px 120px; }
+    .hero-stats { position: static; margin-top: 48px; justify-content: flex-start; }
+    section { padding: 60px 20px; }
+    .register-wrap { grid-template-columns: 1fr; gap: 40px; }
+    footer { flex-direction: column; gap: 12px; text-align: center; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Nav -->
+<nav>
+  <a href="#" class="nav-logo">Scythe</a>
+  <ul class="nav-links">
+    <li><a href="#connect">Connect</a></li>
+    <li><a href="#register">Register</a></li>
+    <li><a href="#leaderboard">Leaderboard</a></li>
+  </ul>
+</nav>
+
+<!-- Hero -->
+<div class="hero">
+  <p class="hero-label">osu! private server</p>
+  <h1 class="hero-title">Play.<br><em>Compete.</em><br>Rank.</h1>
+  <p class="hero-sub">Every map ranked. Ghost scores. Hot streak PP bonuses. Full leaderboards on all beatmaps.</p>
+  <div class="hero-actions">
+    <a href="#register" class="btn">Create account</a>
+    <a href="#connect" class="btn btn-ghost">How to connect</a>
+  </div>
+  <div class="hero-stats">
+    <div class="stat">
+      <span class="stat-val" id="stat-online">—</span>
+      <span class="stat-label">Online</span>
+    </div>
+    <div class="stat">
+      <span class="stat-val" id="stat-users">—</span>
+      <span class="stat-label">Players</span>
+    </div>
+    <div class="stat">
+      <span class="stat-val" id="stat-scores">—</span>
+      <span class="stat-label">Scores</span>
+    </div>
+  </div>
+</div>
+
+<!-- Features -->
+<section id="features">
+  <p class="section-label">Features</p>
+  <div class="features">
+    <div class="feature">
+      <div class="feature-icon">01 — Leaderboards</div>
+      <div class="feature-title">Every map, every time</div>
+      <div class="feature-desc">All beatmaps forced to Loved status. Leaderboards show on every map you play, no exceptions.</div>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">02 — Ghost scores</div>
+      <div class="feature-title">Always see yourself</div>
+      <div class="feature-desc">Your personal best appears on every leaderboard even if you're not in the top 50.</div>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">03 — Hot streak</div>
+      <div class="feature-title">Consecutive FC bonus</div>
+      <div class="feature-desc">Chain full combos to earn up to +15% PP bonus. Keep your streak alive.</div>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">04 — Featured map</div>
+      <div class="feature-title">2× PP daily</div>
+      <div class="feature-desc">One random map gets 2× PP every day. Announced in-game via chat.</div>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">05 — Score decay</div>
+      <div class="feature-title">Stay active</div>
+      <div class="feature-desc">Inactive scores slowly decay over time, encouraging regular play.</div>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">06 — Map voting</div>
+      <div class="feature-title">!love / !hate</div>
+      <div class="feature-desc">Vote on maps in-game. Community votes tracked per beatmap.</div>
+    </div>
+  </div>
+</section>
+
+<!-- Connect -->
+<section id="connect">
+  <p class="section-label">How to connect</p>
+  <div class="connect-steps">
+    <div class="step">
+      <span class="step-num">01</span>
+      <div class="step-content">
+        <div class="step-title">Create an account</div>
+        <div class="step-desc">Register below on this page, then come back here.</div>
+      </div>
+    </div>
+    <div class="step">
+      <span class="step-num">02</span>
+      <div class="step-content">
+        <div class="step-title">Find your osu! shortcut</div>
+        <div class="step-desc">Right click your osu! desktop shortcut or the osu!.exe file → Properties.</div>
+      </div>
+    </div>
+    <div class="step">
+      <span class="step-num">03</span>
+      <div class="step-content">
+        <div class="step-title">Edit the Target field</div>
+        <div class="step-desc">Add <code style="font-family:var(--mono);font-size:12px;background:var(--card);padding:2px 6px;">-devserver 0w0.fit</code> to the end of the Target field. It should look like:</div>
+        <br>
+        <div class="code" onclick="copyText(this, '...\\osu!.exe -devserver 0w0.fit')">
+          ...\osu!.exe -devserver 0w0.fit
+          <span class="copy-hint">click to copy</span>
+        </div>
+      </div>
+    </div>
+    <div class="step">
+      <span class="step-num">04</span>
+      <div class="step-content">
+        <div class="step-title">Launch osu! from that shortcut</div>
+        <div class="step-desc">Log in with your Scythe account. You'll see a welcome message confirming you're connected.</div>
+      </div>
+    </div>
+    <div class="step">
+      <span class="step-num">05</span>
+      <div class="step-content">
+        <div class="step-title">To switch back to Bancho</div>
+        <div class="step-desc">Remove <code style="font-family:var(--mono);font-size:12px;background:var(--card);padding:2px 6px;">-devserver 0w0.fit</code> from the Target field and relaunch.</div>
+      </div>
+    </div>
+  </div>
+
+  <br>
+  <p style="font-family:var(--mono);font-size:11px;color:var(--mid);letter-spacing:0.1em;">
+    IN-GAME COMMANDS &nbsp;—&nbsp;
+    !rank &nbsp;·&nbsp; !pp &nbsp;·&nbsp; !online &nbsp;·&nbsp; !featured &nbsp;·&nbsp; !love &lt;md5&gt; &nbsp;·&nbsp; !hate &lt;md5&gt; &nbsp;·&nbsp; !clip &nbsp;·&nbsp; !stalker on/off
+  </p>
+</section>
+
+<!-- Register -->
+<section id="register">
+  <p class="section-label">Register</p>
+  <div class="register-wrap">
+    <div class="register-info">
+      <h2>Create your account.</h2>
+      <p>One account per person. Username must be 2–15 characters. You'll use these credentials to log into osu! after connecting to Scythe.</p>
+    </div>
+    <div>
+      <form class="form" id="reg-form" onsubmit="register(event)">
+        <div class="field">
+          <label>Username</label>
+          <input type="text" id="reg-username" placeholder="YourName" minlength="2" maxlength="15" required>
+        </div>
+        <div class="field">
+          <label>Email</label>
+          <input type="email" id="reg-email" placeholder="you@example.com" required>
+        </div>
+        <div class="field">
+          <label>Password</label>
+          <input type="password" id="reg-password" placeholder="min 6 characters" minlength="6" required>
+        </div>
+        <div class="form-msg" id="reg-msg"></div>
+        <button type="submit" class="form-submit" id="reg-btn">Create account →</button>
+      </form>
+    </div>
+  </div>
+</section>
+
+<!-- Leaderboard -->
+<section id="leaderboard">
+  <p class="section-label">Leaderboard</p>
+  <table class="lb-table">
+    <thead>
+      <tr>
+        <th class="lb-rank">#</th>
+        <th>Player</th>
+        <th style="text-align:right">PP</th>
+        <th style="text-align:right">Accuracy</th>
+        <th style="text-align:right">Plays</th>
+      </tr>
+    </thead>
+    <tbody id="lb-body">
+      <tr><td colspan="5" class="lb-loading">Loading...</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<footer>
+  <span>Scythe — 0w0.fit</span>
+  <span>Not affiliated with osu! or ppy Pty Ltd.</span>
+</footer>
+
+<script>
+  // ── Load leaderboard ──────────────────────────────────────────────────────
+  async function loadLB() {
+    try {
+      const res = await fetch('/api/v1/leaderboard');
+      const data = await res.json();
+      const tbody = document.getElementById('lb-body');
+
+      if (!data.length) {
+        tbody.innerHTML = '<tr><td colspan="5" class="lb-loading">No scores yet — be the first!</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = data.map(p => `
+        <tr>
+          <td class="lb-rank lb-mono">${p.rank}</td>
+          <td class="lb-name">${escHtml(p.username)}</td>
+          <td class="lb-pp">${Math.round(p.pp).toLocaleString()}pp</td>
+          <td class="lb-acc">${(p.accuracy * 100).toFixed(2)}%</td>
+          <td class="lb-pc">${p.playcount.toLocaleString()}</td>
+        </tr>
+      `).join('');
+
+      // Update hero stats
+      document.getElementById('stat-users').textContent = data.length.toLocaleString();
+      const totalPlays = data.reduce((sum, p) => sum + (p.playcount || 0), 0);
+      document.getElementById('stat-scores').textContent = totalPlays.toLocaleString();
+    } catch (e) {
+      document.getElementById('lb-body').innerHTML =
+        '<tr><td colspan="5" class="lb-loading">Could not load leaderboard.</td></tr>';
+    }
+  }
+
+  // ── Load server stats ─────────────────────────────────────────────────────
+  async function loadStats() {
+    // online count comes from bancho; if not available just hide it
+    try {
+      const res = await fetch('/api/v1/online');
+      if (res.ok) {
+        const data = await res.json();
+        document.getElementById('stat-online').textContent = (data.online ?? '—').toLocaleString();
+      }
+    } catch(e) {
+      document.getElementById('stat-online').closest('.stat').style.display = 'none';
+    }
+  }
+
+  // ── Register ──────────────────────────────────────────────────────────────
+  async function register(e) {
+    e.preventDefault();
+    const btn = document.getElementById('reg-btn');
+    const msg = document.getElementById('reg-msg');
+    const username = document.getElementById('reg-username').value.trim();
+    const email    = document.getElementById('reg-email').value.trim();
+    const password = document.getElementById('reg-password').value;
+
+    btn.disabled = true;
+    btn.textContent = 'Creating...';
+    msg.className = 'form-msg';
+    msg.style.display = '';
+
+    try {
+      const body = new URLSearchParams({
+        'user[username]': username,
+        'user[user_email]': email,
+        'user[plain_password]': password,
+      });
+
+      const res = await fetch('/users', { method: 'POST', body });
+      const data = await res.json();
+
+      if (res.ok) {
+        msg.textContent = `Account created! Log into osu! as "${username}" after connecting to Scythe.`;
+        msg.className = 'form-msg success';
+        document.getElementById('reg-form').reset();
+        loadLB();
+      } else {
+        const errs = data?.form_error?.user || {};
+        const first = Object.values(errs)[0]?.[0] || 'Registration failed.';
+        msg.textContent = first;
+        msg.className = 'form-msg error';
+      }
+    } catch(err) {
+      msg.textContent = 'Network error — try again.';
+      msg.className = 'form-msg error';
+      msg.style.display = '';
+    }
+
+    btn.disabled = false;
+    btn.textContent = 'Create account →';
+  }
+
+  // ── Copy helper ───────────────────────────────────────────────────────────
+  function copyText(el, text) {
+    navigator.clipboard.writeText(text).then(() => {
+      el.classList.add('copied');
+      const hint = el.querySelector('.copy-hint');
+      if (hint) hint.textContent = 'copied!';
+      setTimeout(() => {
+        el.classList.remove('copied');
+        if (hint) hint.textContent = 'click to copy';
+      }, 1500);
+    });
+  }
+
+  function escHtml(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  // ── Init ──────────────────────────────────────────────────────────────────
+  loadLB();
+  loadStats();
+</script>
+</body>
+</html>
