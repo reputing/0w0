@@ -9,7 +9,7 @@ import asyncpg
 DATABASE_URL = os.environ["SUPABASE_DB_URL"]
 
 async def _connect():
-    return await asyncpg.connect(DATABASE_URL)
+    return await asyncpg.connect(DATABASE_URL, statement_cache_size=0)
 
 async def fetchone(query: str, *args):
     conn = await _connect()
