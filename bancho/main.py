@@ -1,24 +1,23 @@
 """
-Scythe — Bancho TCP Server (Railway deployment)
-Handles osu! stable client persistent connection.
-Connects to Supabase for all data.
+Scythe — Bancho HTTP Server (Railway deployment)
+osu! stable uses HTTP POST to cho.domain for all bancho communication.
 """
 import asyncio
-import hashlib
 import struct
-import json
 import time
 import os
 import sys
+import uuid
+from aiohttp import web
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-# ── Config from env ───────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 SERVER_NAME   = os.environ.get("SERVER_NAME", "Scythe")
-SERVER_DOMAIN = os.environ.get("SERVER_DOMAIN", "scythe.gg")
+SERVER_DOMAIN = os.environ.get("SERVER_DOMAIN", "0w0.fit")
 BANCHO_PORT   = int(os.environ.get("PORT", 13381))
 
-# ── Supabase via asyncpg ──────────────────────────────────────────────────────
+# ── Database ──────────────────────────────────────────────────────────────────
 import asyncpg
 
 DATABASE_URL = os.environ["SUPABASE_DB_URL"]
@@ -27,7 +26,10 @@ _pool = None
 async def get_pool():
     global _pool
     if _pool is None:
-        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+        _pool = await asyncpg.create_pool(
+            DATABASE_URL, min_size=1, max_size=10,
+            statement_cache_size=0
+        )
     return _pool
 
 async def db_fetchrow(q, *a):
@@ -45,8 +47,8 @@ async def db_execute(q, *a):
     async with p.acquire() as c:
         return await c.execute(q, *a)
 
-# ── Online registry ───────────────────────────────────────────────────────────
-online: dict = {}   # user_id → BanchoClient
+# ── Online sessions: token → session dict ─────────────────────────────────────
+sessions = {}  # token → {"user": row, "queue": bytearray, "channels": set}
 
 # ── Packet helpers ────────────────────────────────────────────────────────────
 def uleb128(v):
@@ -73,7 +75,7 @@ def pkt(pid, data=b""):
     return w_i16(pid) + b"\x00" + w_u32(len(data)) + data
 
 def r_str(data, off):
-    if data[off] == 0: return "", off+1
+    if off >= len(data) or data[off] == 0: return "", off+1
     off += 1; length = shift = 0
     while True:
         byte = data[off]; off += 1
@@ -83,25 +85,25 @@ def r_str(data, off):
 
 def r_i32(data, off): return struct.unpack_from("<i",data,off)[0], off+4
 
-# ── Server → Client packet builders ──────────────────────────────────────────
-def pkt_login_reply(uid):    return pkt(5, w_i32(uid))
-def pkt_notification(msg):   return pkt(24, w_str(msg))
-def pkt_protocol(v=19):      return pkt(75, w_i32(v))
-def pkt_pong():               return pkt(8)
-def pkt_logout(uid):         return pkt(12, w_i32(uid))
-def pkt_friends(ids):
-    d = w_i16(len(ids))
-    for i in ids: d += w_i32(i)
-    return pkt(102, d)
+# ── Packet builders ───────────────────────────────────────────────────────────
+def pkt_login_reply(uid):      return pkt(5, w_i32(uid))
+def pkt_notification(msg):     return pkt(24, w_str(msg))
+def pkt_protocol(v=19):        return pkt(75, w_i32(v))
+def pkt_pong():                 return pkt(8)
+def pkt_logout(uid):           return pkt(12, w_i32(uid))
 def pkt_channel_info(name, topic, count):
     return pkt(65, w_str(name)+w_str(topic)+w_i16(count))
 def pkt_channel_join_ok(name): return pkt(64, w_str(name))
 def pkt_menu_icon(icon, url):  return pkt(26, w_str(f"{icon}|{url}"))
 def pkt_message(sender, text, channel, sid):
     return pkt(7, w_str(sender)+w_str(text)+w_str(channel)+w_i32(sid))
+def pkt_friends(ids):
+    d = w_i16(len(ids))
+    for i in ids: d += w_i32(i)
+    return pkt(102, d)
 
 def pkt_user_stats(u):
-    status = (w_i8(0)+w_str("")+w_str("")+w_u32(0)+w_i8(0)+w_i32(0))
+    status = w_i8(0)+w_str("")+w_str("")+w_u32(0)+w_i8(0)+w_i32(0)
     d = (w_i32(u["id"]) + status +
          w_i64(int(u["ranked_score"] or 0)) +
          w_f32(float(u["accuracy"] or 0)) +
@@ -117,273 +119,190 @@ def pkt_user_presence(u, tz=0):
          w_f32(0.0) + w_f32(0.0) + w_i32(int(u["rank"] or 0)))
     return pkt(83, d)
 
-# ── Client session ────────────────────────────────────────────────────────────
-class BanchoClient:
-    def __init__(self, reader, writer, user):
-        self.reader   = reader
-        self.writer   = writer
-        self.user     = dict(user)
-        self.user_id  = user["id"]
-        self.username = user["username"]
-        self.queue    = asyncio.Queue()
-        self.channels = {"#osu"}
-        self.spectating = None
-        self.spectators = set()
+# ── Enqueue to a session ──────────────────────────────────────────────────────
+def enqueue(token, data):
+    if token in sessions:
+        sessions[token]["queue"] += data
 
-    async def send(self, data):
-        try: self.writer.write(data); await self.writer.drain()
-        except Exception: pass
+def broadcast(data, exclude_token=None):
+    for tok, s in sessions.items():
+        if tok != exclude_token:
+            s["queue"] += data
 
-    async def enqueue(self, data): await self.queue.put(data)
-
-    async def flush(self):
-        buf = b""
-        while not self.queue.empty():
-            buf += await self.queue.get()
-        if buf: await self.send(buf)
-
-# ── Login ─────────────────────────────────────────────────────────────────────
-async def parse_login(reader):
+# ── Login handler ─────────────────────────────────────────────────────────────
+async def handle_login(body_bytes):
     try:
-        raw = await asyncio.wait_for(reader.read(4096), timeout=10)
-        lines = raw.decode("utf-8","ignore").split("\n")
-        if len(lines) < 3: return None
+        lines = body_bytes.decode("utf-8", "ignore").split("\n")
+        if len(lines) < 3:
+            return -1, b"", "Bad request"
         username = lines[0].strip()
         pw_md5   = lines[1].strip()
         parts    = lines[2].strip().split("|")
         tz       = int(parts[1]) if len(parts) > 1 else 0
-        return username, pw_md5, tz
-    except Exception: return None
+    except Exception:
+        return -1, b"", "Parse error"
 
-# ── Connection handler ────────────────────────────────────────────────────────
-async def handle_conn(reader, writer):
-    addr = writer.get_extra_info("peername")
-    parsed = await parse_login(reader)
-    if not parsed: writer.close(); return
-
-    username, pw_md5, tz = parsed
     safe = username.lower().replace(" ", "_")
     user = await db_fetchrow("SELECT * FROM users WHERE username_safe=$1", safe)
 
     if not user:
-        writer.write(pkt_login_reply(-1) + pkt_notification("User not found."))
-        await writer.drain(); writer.close(); return
+        resp = pkt_login_reply(-1) + pkt_notification("User not found.")
+        return -1, resp, "no_user"
 
     if user["password_md5"] != pw_md5:
-        writer.write(pkt_login_reply(-1) + pkt_notification("Wrong password."))
-        await writer.drain(); writer.close(); return
+        resp = pkt_login_reply(-1) + pkt_notification("Wrong password.")
+        return -1, resp, "bad_pw"
 
     if user["status"] == 1:
-        writer.write(pkt_login_reply(-3) + pkt_notification(
-            "Your account has been restricted."))
-        await writer.drain(); writer.close(); return
+        resp = pkt_login_reply(-3) + pkt_notification("Your account is restricted.")
+        return -1, resp, "restricted"
 
-    # status=2 (shadowban) logs in normally — silent
-    client = BanchoClient(reader, writer, user)
-    online[user["id"]] = client
-    print(f"[BANCHO] {username} logged in (id={user['id']}, status={user['status']})")
+    token = str(uuid.uuid4())
+    sessions[token] = {
+        "user": dict(user),
+        "queue": bytearray(),
+        "channels": {"#osu"},
+        "token": token,
+        "tz": tz,
+    }
 
-    # Update last seen
     await db_execute("UPDATE users SET last_seen=$1 WHERE id=$2", int(time.time()), user["id"])
+    print(f"[BANCHO] {username} logged in (id={user['id']})")
 
-    friends = user["friends"] or []
+    friends = list(user["friends"] or [])
 
-    # Build login burst
-    resp = b""
+    resp = bytearray()
     resp += pkt_login_reply(user["id"])
     resp += pkt_protocol(19)
-    resp += pkt_notification(f"Welcome to {SERVER_NAME}! PP on all maps | Ghost scores | Hot streak PP")
+    resp += pkt_notification(f"Welcome to {SERVER_NAME}!")
     resp += pkt_menu_icon("", f"https://{SERVER_DOMAIN}")
-    resp += pkt_friends(list(friends))
-    resp += pkt_channel_info("#osu", "Main", len(online))
+    resp += pkt_friends(friends)
+    resp += pkt_channel_info("#osu", "Main", len(sessions))
     resp += pkt_channel_info("#announce", "Announcements", 1)
     resp += pkt_channel_join_ok("#osu")
     resp += pkt_channel_join_ok("#announce")
     resp += pkt_user_stats(user)
     resp += pkt_user_presence(user, tz)
 
-    for uid, oc in online.items():
-        if uid != user["id"]:
-            resp += pkt_user_presence(oc.user) + pkt_user_stats(oc.user)
+    # Send existing users to new player
+    for tok, s in sessions.items():
+        if tok != token:
+            resp += pkt_user_presence(s["user"]) + pkt_user_stats(s["user"])
 
-    # Announce arrival
-    join_pkt = (pkt_user_presence(user) + pkt_user_stats(user) +
-                pkt_message(SERVER_NAME, f"{username} connected!", "#osu", 0))
-    for uid, oc in online.items():
-        if uid != user["id"]:
-            await oc.enqueue(join_pkt)
+    # Announce to everyone else
+    join = pkt_user_presence(user) + pkt_user_stats(user)
+    broadcast(join, exclude_token=token)
 
-    await client.send(resp)
+    return token, bytes(resp), "ok"
 
-    # ── Packet loop ───────────────────────────────────────────────────────────
-    try:
-        while True:
-            await client.flush()
-            try:
-                header = await asyncio.wait_for(reader.read(7), timeout=65)
-            except asyncio.TimeoutError:
-                break
-            if len(header) < 7: break
-            pid  = struct.unpack_from("<H", header, 0)[0]
-            plen = struct.unpack_from("<I", header, 3)[0]
-            body = await reader.read(min(plen, 65536)) if plen else b""
-            await handle_pkt(client, pid, body)
-    except Exception as e:
-        print(f"[BANCHO] {username} error: {e}")
-    finally:
-        await disconnect(client)
+# ── Packet loop ───────────────────────────────────────────────────────────────
+async def handle_packets(token, body):
+    if token not in sessions:
+        return b""
 
-# ── Packet dispatch ───────────────────────────────────────────────────────────
-async def handle_pkt(client, pid, body):
-    # Ping
-    if pid == 4:
-        await client.send(pkt_pong())
+    s = sessions[token]
+    user = s["user"]
+    off = 0
 
-    # Logout
-    elif pid == 2:
-        raise ConnectionError("logout")
+    while off < len(body) - 6:
+        pid  = struct.unpack_from("<H", body, off)[0]; off += 2
+        off += 1  # padding
+        plen = struct.unpack_from("<I", body, off)[0]; off += 4
+        pkt_body = body[off:off+plen]; off += plen
 
-    # Request stats update
-    elif pid == 3:
-        u = await db_fetchrow("SELECT * FROM users WHERE id=$1", client.user_id)
-        if u: await client.send(pkt_user_stats(u))
+        # Ping
+        if pid == 4:
+            s["queue"] += pkt_pong()
 
-    # Public chat
-    elif pid == 1:
-        await handle_chat(client, body, public=True)
+        # Logout
+        elif pid == 2:
+            await disconnect(token)
+            return bytes(s["queue"])
 
-    # Private message
-    elif pid == 25:
-        await handle_chat(client, body, public=False)
+        # Status update (just ack)
+        elif pid == 0:
+            pass
 
-    # Channel join
-    elif pid == 63:
-        ch, _ = r_str(body, 0)
-        client.channels.add(ch)
-        await client.send(pkt_channel_join_ok(ch))
+        # Request stats
+        elif pid == 3:
+            u = await db_fetchrow("SELECT * FROM users WHERE id=$1", user["id"])
+            if u:
+                s["user"] = dict(u)
+                s["queue"] += pkt_user_stats(u)
 
-    # Friend add
-    elif pid == 73:
-        tid = struct.unpack_from("<i", body, 0)[0]
-        await friend_add(client.user_id, tid)
+        # Public chat
+        elif pid == 1:
+            await handle_chat(token, pkt_body, public=True)
 
-    # Friend remove
-    elif pid == 74:
-        tid = struct.unpack_from("<i", body, 0)[0]
-        await friend_remove(client.user_id, tid)
+        # Private chat
+        elif pid == 25:
+            await handle_chat(token, pkt_body, public=False)
 
-    # Start spectating
-    elif pid == 16:
-        tid = struct.unpack_from("<i", body, 0)[0]
-        await start_spec(client, tid)
+        # Channel join
+        elif pid == 63:
+            ch, _ = r_str(pkt_body, 0)
+            s["channels"].add(ch)
+            s["queue"] += pkt_channel_join_ok(ch)
 
-    # Stop spectating
-    elif pid == 17:
-        await stop_spec(client)
+        # Friend add
+        elif pid == 73:
+            tid = struct.unpack_from("<i", pkt_body, 0)[0]
+            await friend_add(user["id"], tid)
 
-    # Stats request for list of users
-    elif pid == 85:
-        count = struct.unpack_from("<h", body, 0)[0]
-        for i in range(count):
-            uid = struct.unpack_from("<i", body, 2+i*4)[0]
-            u   = await db_fetchrow("SELECT * FROM users WHERE id=$1", uid)
-            if u: await client.send(pkt_user_stats(u)+pkt_user_presence(u))
+        # Friend remove
+        elif pid == 74:
+            tid = struct.unpack_from("<i", pkt_body, 0)[0]
+            await friend_remove(user["id"], tid)
 
-# ── Chat & bot commands ───────────────────────────────────────────────────────
-async def handle_chat(client, body, public=True):
+        # User stats request
+        elif pid == 85:
+            count = struct.unpack_from("<h", pkt_body, 0)[0]
+            for i in range(count):
+                uid = struct.unpack_from("<i", pkt_body, 2+i*4)[0]
+                u = await db_fetchrow("SELECT * FROM users WHERE id=$1", uid)
+                if u: s["queue"] += pkt_user_stats(u) + pkt_user_presence(u)
+
+    out = bytes(s["queue"])
+    s["queue"] = bytearray()
+    return out
+
+# ── Chat ──────────────────────────────────────────────────────────────────────
+async def handle_chat(token, body, public=True):
+    s = sessions.get(token)
+    if not s: return
     try:
         off = 0
         _, off = r_str(body, off)
         msg, off = r_str(body, off)
         ch,  off = r_str(body, off)
-
         if msg.startswith("!"):
-            await bot_cmd(client, msg, ch); return
-
-        mpkt = pkt_message(client.username, msg, ch, client.user_id)
-        for uid, oc in online.items():
-            if uid != client.user_id and ch in oc.channels:
-                await oc.enqueue(mpkt)
+            await bot_cmd(token, msg, ch); return
+        mpkt = pkt_message(s["user"]["username"], msg, ch, s["user"]["id"])
+        for tok, other in sessions.items():
+            if tok != token and ch in other["channels"]:
+                other["queue"] += mpkt
     except Exception as e:
         print(f"[CHAT] {e}")
 
-async def bot_cmd(client, cmd, ch):
+async def bot_cmd(token, cmd, ch):
+    s = sessions.get(token)
+    if not s: return
     parts = cmd.strip().split()
-    c     = parts[0].lower()
-    u     = await db_fetchrow("SELECT * FROM users WHERE id=$1", client.user_id)
+    c = parts[0].lower()
+    u = await db_fetchrow("SELECT * FROM users WHERE id=$1", s["user"]["id"])
 
-    def reply(msg):
-        return pkt_message("ScytheBot", msg, ch, 0)
+    def reply(msg): return pkt_message("ScytheBot", msg, ch, 0)
 
     if c == "!help":
-        await client.send(reply(
-            "Commands: !rank !pp !online !featured !stalker on/off !love <md5> !hate <md5> !clip"
-        ))
+        s["queue"] += reply("Commands: !rank !pp !online")
     elif c == "!rank":
-        await client.send(reply(
-            f"{client.username} — Rank #{u['rank']} | {u['pp']:.0f}pp | Acc {(u['accuracy'] or 0)*100:.2f}%"
-        ))
+        s["queue"] += reply(f"{u['username']} — Rank #{u['rank']} | {u['pp'] or 0:.0f}pp | Acc {(u['accuracy'] or 0)*100:.2f}%")
     elif c == "!pp":
-        await client.send(reply(f"{client.username}: {u['pp']:.2f}pp | Streak: {u['hot_streak']}x"))
+        s["queue"] += reply(f"{u['username']}: {u['pp'] or 0:.2f}pp")
     elif c == "!online":
-        await client.send(reply(f"{len(online)} player(s) online on {SERVER_NAME}."))
-    elif c == "!featured":
-        fm = await db_fetchrow("SELECT * FROM featured_map WHERE id=1")
-        if fm: await client.send(reply(f"Today's featured map (2x PP!): {fm['beatmap_md5']}"))
-        else:  await client.send(reply("No featured map set today."))
-    elif c == "!stalker" and len(parts) > 1:
-        on = parts[1].lower() == "on"
-        await db_execute("UPDATE users SET stalker_mode=$1 WHERE id=$2", on, client.user_id)
-        await client.send(reply(f"Stalker mode {'ON' if on else 'OFF'}."))
-    elif c == "!clip":
-        await client.send(reply(f"Score bookmarked! View at https://{SERVER_DOMAIN}/u/{client.user_id}/clips"))
-    elif c == "!love" and len(parts) > 1:
-        md5 = parts[1]
-        await db_execute("""
-            INSERT INTO map_votes (user_id,beatmap_md5,vote) VALUES($1,$2,1)
-            ON CONFLICT(user_id,beatmap_md5) DO UPDATE SET vote=1
-        """, client.user_id, md5)
-        await client.send(reply(f"Voted LOVE on {md5[:10]}..."))
-    elif c == "!hate" and len(parts) > 1:
-        md5 = parts[1]
-        await db_execute("""
-            INSERT INTO map_votes (user_id,beatmap_md5,vote) VALUES($1,$2,-1)
-            ON CONFLICT(user_id,beatmap_md5) DO UPDATE SET vote=-1
-        """, client.user_id, md5)
-        await client.send(reply(f"Voted HATE on {md5[:10]}..."))
+        s["queue"] += reply(f"{len(sessions)} player(s) online on {SERVER_NAME}.")
 
-    # Admin commands
-    elif c == "!shadowban" and u["status"] == 3 and len(parts) > 1:
-        safe = parts[1].lower()
-        await db_execute("UPDATE users SET status=2 WHERE username_safe=$1 AND status!=3", safe)
-        await client.send(reply(f"[ADMIN] {parts[1]} shadowbanned."))
-    elif c == "!restrict" and u["status"] == 3 and len(parts) > 1:
-        safe = parts[1].lower()
-        await db_execute("UPDATE users SET status=1 WHERE username_safe=$1 AND status!=3", safe)
-        await client.send(reply(f"[ADMIN] {parts[1]} restricted."))
-    elif c == "!unrestrict" and u["status"] == 3 and len(parts) > 1:
-        safe = parts[1].lower()
-        await db_execute("UPDATE users SET status=0 WHERE username_safe=$1", safe)
-        await client.send(reply(f"[ADMIN] {parts[1]} unrestricted."))
-
-# ── Spectating ────────────────────────────────────────────────────────────────
-async def start_spec(client, target_id):
-    if target_id in online:
-        tgt = online[target_id]
-        tgt.spectators.add(client.user_id)
-        client.spectating = target_id
-        tu = await db_fetchrow("SELECT stalker_mode FROM users WHERE id=$1", target_id)
-        if tu and tu["stalker_mode"]:
-            await tgt.enqueue(pkt_message(
-                "ScytheBot", f"{client.username} is spectating you!", "#osu", 0
-            ))
-
-async def stop_spec(client):
-    if client.spectating and client.spectating in online:
-        online[client.spectating].spectators.discard(client.user_id)
-    client.spectating = None
-
-# ── Friend management ─────────────────────────────────────────────────────────
+# ── Friend helpers ────────────────────────────────────────────────────────────
 async def friend_add(uid, tid):
     u = await db_fetchrow("SELECT friends FROM users WHERE id=$1", uid)
     if u:
@@ -399,37 +318,60 @@ async def friend_remove(uid, tid):
         await db_execute("UPDATE users SET friends=$1 WHERE id=$2", friends, uid)
 
 # ── Disconnect ────────────────────────────────────────────────────────────────
-async def disconnect(client):
-    online.pop(client.user_id, None)
-    lpkt = pkt_logout(client.user_id)
-    for oc in online.values():
-        await oc.enqueue(lpkt)
-    try: client.writer.close()
-    except Exception: pass
-    print(f"[BANCHO] {client.username} disconnected. Online: {len(online)}")
+async def disconnect(token):
+    s = sessions.pop(token, None)
+    if not s: return
+    uid = s["user"]["id"]
+    print(f"[BANCHO] {s['user']['username']} disconnected. Online: {len(sessions)}")
+    broadcast(pkt_logout(uid))
 
-# ── Background: rank recalc + featured map rotation ──────────────────────────
+# ── HTTP handler ──────────────────────────────────────────────────────────────
+async def bancho_handler(request):
+    token = request.headers.get("osu-token")
+    body  = await request.read()
+
+    if not token:
+        # Login request
+        tok, resp, status = await handle_login(body)
+        if tok == -1:
+            return web.Response(
+                body=resp,
+                headers={"cho-token": "no", "cho-protocol": "19",
+                         "Content-Type": "application/octet-stream"}
+            )
+        return web.Response(
+            body=resp,
+            headers={"cho-token": tok, "cho-protocol": "19",
+                     "Content-Type": "application/octet-stream"}
+        )
+    else:
+        # Subsequent packets
+        resp = await handle_packets(token, body)
+        return web.Response(
+            body=resp,
+            headers={"Content-Type": "application/octet-stream"}
+        )
+
+# ── Background tasks ──────────────────────────────────────────────────────────
 async def background_tasks():
-    import datetime, random
+    import datetime
     while True:
         try:
             await asyncio.sleep(300)
-
-            # Rank recalc every 5 min
             await db_execute("""
                 UPDATE users SET rank=(
                     SELECT COUNT(*)+1 FROM users u2
-                    WHERE u2.pp>users.pp AND u2.status!=1
-                ) WHERE status!=1
+                    WHERE u2.pp > users.pp AND u2.status != 1
+                ) WHERE status != 1
             """)
             await db_execute("UPDATE users SET rank=0 WHERE status=1")
 
-            # Featured map rotation (daily)
             today = datetime.date.today().isoformat()
-            fm    = await db_fetchrow("SELECT date FROM featured_map WHERE id=1")
+            fm = await db_fetchrow("SELECT date FROM featured_map WHERE id=1")
             if not fm or fm["date"] != today:
                 candidate = await db_fetchrow("""
-                    SELECT DISTINCT beatmap_md5 FROM scores WHERE passed=TRUE ORDER BY RANDOM() LIMIT 1
+                    SELECT beatmap_md5 FROM scores WHERE passed=TRUE
+                    ORDER BY RANDOM() LIMIT 1
                 """)
                 if candidate:
                     md5 = candidate["beatmap_md5"]
@@ -437,15 +379,7 @@ async def background_tasks():
                         INSERT INTO featured_map (id,beatmap_md5,date) VALUES(1,$1,$2)
                         ON CONFLICT(id) DO UPDATE SET beatmap_md5=$1,date=$2
                     """, md5, today)
-                    msg = pkt_message(
-                        "ScytheBot",
-                        f"Today's featured map (2x PP!): {md5} — use !featured",
-                        "#announce", 0
-                    )
-                    for oc in online.values():
-                        await oc.enqueue(msg)
-                    print(f"[BANCHO] Featured map rotated → {md5}")
-
+                    print(f"[BANCHO] Featured map → {md5}")
         except Exception as e:
             print(f"[BG] Error: {e}")
 
@@ -454,16 +388,18 @@ async def main():
     print(f"""
 ╔══════════════════════════════════════════╗
 ║    SCYTHE BANCHO — Railway Deployment    ║
-║    Port {BANCHO_PORT} | Supabase backend          ║
+║    Port {BANCHO_PORT} | HTTP mode | Supabase       ║
 ╚══════════════════════════════════════════╝
     """)
-    server = await asyncio.start_server(handle_conn, "0.0.0.0", BANCHO_PORT)
+    app = web.Application(client_max_size=10*1024*1024)
+    app.router.add_post("/", bancho_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", BANCHO_PORT)
+    await site.start()
     print(f"[BANCHO] Listening on 0.0.0.0:{BANCHO_PORT}")
-    async with server:
-        await asyncio.gather(
-            server.serve_forever(),
-            background_tasks()
-        )
+    await background_tasks()
 
 if __name__ == "__main__":
     asyncio.run(main())
