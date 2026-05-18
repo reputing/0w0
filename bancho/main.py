@@ -31,11 +31,19 @@ async def get_pool():
     return _pool
 
 async def db_fetchrow(q, *a):
-    p = await get_pool(); async with p.acquire() as c: return await c.fetchrow(q, *a)
+    p = await get_pool()
+    async with p.acquire() as c:
+        return await c.fetchrow(q, *a)
+
 async def db_fetch(q, *a):
-    p = await get_pool(); async with p.acquire() as c: return await c.fetch(q, *a)
+    p = await get_pool()
+    async with p.acquire() as c:
+        return await c.fetch(q, *a)
+
 async def db_execute(q, *a):
-    p = await get_pool(); async with p.acquire() as c: return await c.execute(q, *a)
+    p = await get_pool()
+    async with p.acquire() as c:
+        return await c.execute(q, *a)
 
 # ── Online registry ───────────────────────────────────────────────────────────
 online: dict = {}   # user_id → BanchoClient
