@@ -135,12 +135,38 @@ class handler(BaseHTTPRequestHandler):
             "pp":           user["pp"] or 0.0,
         }
 
+        # ── Pause detection ──
+        # osu! sends 'ft' (fail time in ms) in the multipart body.
+        # If ft > 0 on a passed score, the player paused during the play.
+        # Also check 'st' (score time ms) vs beatmap total_length — if the
+        # score took significantly longer than the map, they paused.
+        paused = False
+        try:
+            ft = int((fields.get("ft") or b"0").decode("utf-8", "ignore").strip() or 0)
+            st = int((fields.get("st") or b"0").decode("utf-8", "ignore").strip() or 0)
+            map_length_ms = (beatmap.get("total_length") or 0) * 1000
+            if ft > 0 and parsed["passed"]:
+                paused = True
+            elif st > 0 and map_length_ms > 0 and st > map_length_ms * 1.5:
+                paused = True
+        except (ValueError, TypeError):
+            pass
+
         score_id = await submit_score(
             user["id"], parsed["beatmap_md5"], parsed["score"], pp, accuracy,
             parsed["max_combo"],
             parsed["count300"], parsed["count100"], parsed["count50"], parsed["countmiss"],
             parsed["mods"], rank_str, parsed["is_fc"], parsed["passed"],
         )
+
+        # Tag paused scores in the database
+        if paused and score_id:
+            try:
+                await execute(
+                    "UPDATE scores SET paused=TRUE WHERE id=$1", score_id,
+                )
+            except Exception:
+                pass  # column might not exist yet — non-critical
 
         # Anti-cheat
         flags = []

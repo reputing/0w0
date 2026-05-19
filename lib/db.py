@@ -134,7 +134,7 @@ async def get_leaderboard(beatmap_md5: str, limit=50,
             FROM scores s JOIN users u ON s.user_id=u.id
             WHERE s.beatmap_md5=$1 AND s.passed=TRUE AND u.status!=1
               AND s.user_id=ANY($2)
-            ORDER BY s.pp DESC LIMIT $3
+            ORDER BY (COALESCE(s.paused, FALSE)) ASC, s.pp DESC LIMIT $3
             """,
             beatmap_md5, friends_list, limit,
         )
@@ -144,7 +144,7 @@ async def get_leaderboard(beatmap_md5: str, limit=50,
             SELECT s.*, u.username, u.country, u.status as user_status
             FROM scores s JOIN users u ON s.user_id=u.id
             WHERE s.beatmap_md5=$1 AND s.passed=TRUE AND u.status!=1
-            ORDER BY s.pp DESC LIMIT $2
+            ORDER BY (COALESCE(s.paused, FALSE)) ASC, s.pp DESC LIMIT $2
             """,
             beatmap_md5, limit,
         )

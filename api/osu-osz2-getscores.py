@@ -109,6 +109,9 @@ class handler(BaseHTTPRequestHandler):
 
 def _fmt(row, pos: int, ghost: bool = False) -> str:
     name = ("[Ghost] " + row["username"]) if ghost else row["username"]
+    # Mark paused scores with [P] suffix so players know
+    if row.get("paused"):
+        name += " [P]"
     # Last field is "has_replay" (1/0). We have no replays → 0.
     return (
         f"{row['id']}|{name}|{row['score']}|{row['max_combo']}|"

@@ -65,7 +65,10 @@ CREATE TABLE IF NOT EXISTS scores (
     ac_flag_reason TEXT DEFAULT '',
     ac_reviewed BOOLEAN DEFAULT FALSE,
     pp_decayed REAL DEFAULT 0.0,
-    last_decay_check BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())
+    last_decay_check BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()),
+
+    -- TRUE if the player paused during this play
+    paused BOOLEAN DEFAULT FALSE
 );
 
 -- ── Beatmaps ──────────────────────────────────────────────────────────────────
@@ -133,6 +136,7 @@ CREATE INDEX IF NOT EXISTS idx_users_pp ON users(pp DESC);
 
 -- Migration for existing beatmaps table:
 ALTER TABLE beatmaps ADD COLUMN IF NOT EXISTS skillset JSONB;
+ALTER TABLE scores ADD COLUMN IF NOT EXISTS paused BOOLEAN DEFAULT FALSE;
 
 -- ── Default admin user ────────────────────────────────────────────────────────
 -- Password is MD5 of "changeme123" — CHANGE THIS
