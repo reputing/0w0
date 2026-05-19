@@ -136,8 +136,10 @@ CREATE INDEX IF NOT EXISTS idx_users_pp ON users(pp DESC);
 
 -- Migration for existing beatmaps table:
 ALTER TABLE beatmaps ADD COLUMN IF NOT EXISTS skillset JSONB;
+ALTER TABLE beatmaps ADD COLUMN IF NOT EXISTS tags TEXT DEFAULT '';
 ALTER TABLE scores ADD COLUMN IF NOT EXISTS paused BOOLEAN DEFAULT FALSE;
 ALTER TABLE scores ADD COLUMN IF NOT EXISTS per_column_acc JSONB;
+ALTER TABLE scores ADD COLUMN IF NOT EXISTS replay_path TEXT;
 
 -- ── Dan Courses ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS dan_courses (

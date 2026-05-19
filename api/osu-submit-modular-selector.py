@@ -22,6 +22,7 @@ from lib.pp import (
 )
 from lib.scoresub import parse_multipart, decrypt_score, parse_score_string
 from lib.skillset import compute_beatmap_skillset, compute_user_profile
+from lib.osu_api import fetch_and_update_beatmap
 
 
 class handler(BaseHTTPRequestHandler):
@@ -83,6 +84,21 @@ class handler(BaseHTTPRequestHandler):
 
         # Beatmap (auto-loved so leaderboard shows up no matter what)
         beatmap = await get_or_create_beatmap(parsed["beatmap_md5"])
+
+        # If the beatmap has no title, it's a fresh placeholder — fetch from osu! API
+        if not beatmap.get("title") or beatmap["title"] == "":
+            try:
+                api_data = await fetch_and_update_beatmap(
+                    parsed["beatmap_md5"], execute, fetchone
+                )
+                if api_data:
+                    # Re-fetch the updated row so we have real metadata
+                    beatmap = await fetchone(
+                        "SELECT * FROM beatmaps WHERE md5=$1", parsed["beatmap_md5"]
+                    ) or beatmap
+            except Exception:
+                pass  # API unavailable — continue with defaults
+
         stars = beatmap["diff_rating"] or 3.0
         ar    = beatmap["ar"] or 9.0
         od    = beatmap["od"] or 8.0
@@ -204,6 +220,28 @@ class handler(BaseHTTPRequestHandler):
                 )
             except Exception:
                 pass
+
+        # ── Replay storage ──
+        # osu! sends the replay data as 'score' (when encrypted) or as a
+        # separate 'replay' field in the multipart body. We store the raw
+        # bytes to disk (or a path placeholder for future S3/R2 upload).
+        if score_id:
+            try:
+                replay_data = fields.get("replay") or fields.get("score_replay")
+                if replay_data and len(replay_data) > 50:
+                    # Store in a local replays directory (Railway ephemeral storage).
+                    # For persistent storage, swap this with R2/S3 upload.
+                    import pathlib
+                    replay_dir = pathlib.Path("/tmp/replays")
+                    replay_dir.mkdir(parents=True, exist_ok=True)
+                    replay_path = replay_dir / f"{score_id}.osr"
+                    replay_path.write_bytes(replay_data)
+                    await execute(
+                        "UPDATE scores SET replay_path=$1 WHERE id=$2",
+                        str(replay_path), score_id,
+                    )
+            except Exception:
+                pass  # non-critical — replay storage is best-effort
 
         # ── Dan course progress check ──
         if parsed["passed"] and not paused:

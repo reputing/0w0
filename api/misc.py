@@ -124,15 +124,120 @@ class handler(BaseHTTPRequestHandler):
                         "accuracy": user["accuracy"],
                         "playcount": user["playcount"],
                         "ranked_score": user["ranked_score"],
+                        "total_score": user["total_score"],
+                        "max_combo": user["max_combo"],
                         "hot_streak": user["hot_streak"],
                         "country": user["country"],
+                        "registered_at": user["registered_at"],
                         "avatar_url": user["avatar_url"] or _default_avatar_url(user["id"]),
                         "skill_profile": user.get("skill_profile") or {},
+                        "friends": user.get("friends") or [],
                     })
                     return
             except Exception:
                 pass
             self._json({"error": "not_found"}, 404)
+            return
+
+        # ── User scores (recent/top) ──
+        if path.startswith("/api/v1/user/") and "/scores" in path:
+            try:
+                parts_path = path.split("/")
+                uid = int(parts_path[4])  # /api/v1/user/<id>/scores
+                mode = params.get("type", "recent")  # "recent" or "best"
+                limit = min(int(params.get("limit", 20)), 50)
+
+                if mode == "best":
+                    rows = await fetchall(
+                        """
+                        SELECT s.*, b.title, b.artist, b.version, b.diff_rating
+                        FROM scores s LEFT JOIN beatmaps b ON b.md5 = s.beatmap_md5
+                        WHERE s.user_id=$1 AND s.passed=TRUE
+                        ORDER BY s.pp DESC LIMIT $2
+                        """,
+                        uid, limit,
+                    )
+                else:
+                    rows = await fetchall(
+                        """
+                        SELECT s.*, b.title, b.artist, b.version, b.diff_rating
+                        FROM scores s LEFT JOIN beatmaps b ON b.md5 = s.beatmap_md5
+                        WHERE s.user_id=$1
+                        ORDER BY s.submitted_at DESC LIMIT $2
+                        """,
+                        uid, limit,
+                    )
+
+                data = []
+                for r in rows:
+                    data.append({
+                        "id": r["id"],
+                        "beatmap_md5": r["beatmap_md5"],
+                        "title": r.get("title") or "Unknown",
+                        "artist": r.get("artist") or "Unknown",
+                        "version": r.get("version") or "",
+                        "diff_rating": r.get("diff_rating") or 0,
+                        "score": r["score"],
+                        "pp": r["pp"],
+                        "accuracy": r["accuracy"],
+                        "max_combo": r["max_combo"],
+                        "mods": r["mods"],
+                        "rank": r["rank"],
+                        "is_fc": r["is_fc"],
+                        "passed": r["passed"],
+                        "paused": r.get("paused") or False,
+                        "submitted_at": r["submitted_at"],
+                    })
+                self._json(data)
+                return
+            except Exception:
+                pass
+            self._json([])
+            return
+
+        # ── User friends list with pp ──
+        if path.startswith("/api/v1/user/") and "/friends" in path:
+            try:
+                parts_path = path.split("/")
+                uid = int(parts_path[4])  # /api/v1/user/<id>/friends
+                user = await get_user_by_id(uid)
+                if not user:
+                    self._json([])
+                    return
+                friends_ids = user.get("friends") or []
+                if isinstance(friends_ids, str):
+                    import json as _json
+                    friends_ids = _json.loads(friends_ids)
+                if not friends_ids:
+                    self._json([])
+                    return
+                # Fetch friend details
+                friends_data = await fetchall(
+                    """
+                    SELECT id, username, pp, rank, accuracy, playcount, country, avatar_url
+                    FROM users WHERE id = ANY($1) AND status != 1
+                    ORDER BY pp DESC
+                    """,
+                    [int(f) for f in friends_ids if str(f).isdigit()],
+                )
+                data = [
+                    {
+                        "id": f["id"],
+                        "username": f["username"],
+                        "pp": f["pp"],
+                        "rank": f["rank"],
+                        "accuracy": f["accuracy"],
+                        "playcount": f["playcount"],
+                        "country": f["country"],
+                        "avatar_url": f["avatar_url"] or _default_avatar_url(f["id"]),
+                    }
+                    for f in friends_data
+                ]
+                self._json(data)
+                return
+            except Exception:
+                pass
+            self._json([])
             return
 
         # ── osu! client stub endpoints ──
