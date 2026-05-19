@@ -11,6 +11,7 @@
     { "src": "/admin(.*)",                            "dest": "/api/admin.py" },
     { "src": "/api/v1/(.*)",                          "dest": "/api/misc.py" },
     { "src": "/u/(.*)",                               "dest": "/api/misc.py" },
+    { "src": "/avatar/(.*)",                          "dest": "/api/misc.py" },
     { "src": "/",                                     "dest": "/public/index.html" },
     { "src": "/(.*)",                                 "dest": "/api/misc.py" }
   ]

@@ -721,15 +721,16 @@
 
   // ── Load server stats ─────────────────────────────────────────────────────
   async function loadStats() {
-    // online count comes from bancho; if not available just hide it
     try {
       const res = await fetch('/api/v1/online');
       if (res.ok) {
         const data = await res.json();
-        document.getElementById('stat-online').textContent = (data.online ?? '—').toLocaleString();
+        const v = data.online ?? 0;
+        document.getElementById('stat-online').textContent =
+          (typeof v === 'number') ? v.toLocaleString() : v;
       }
-    } catch(e) {
-      document.getElementById('stat-online').closest('.stat').style.display = 'none';
+    } catch (e) {
+      document.getElementById('stat-online').textContent = '0';
     }
   }
 

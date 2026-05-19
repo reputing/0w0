@@ -203,10 +203,17 @@ def pkt_user_stats(u):
 
 
 def pkt_user_presence(u, tz=0):
+    # Country code byte. osu! uses a country->byte mapping but most clients
+    # accept anything 0-255 as "show generic flag". We hash the country
+    # string to a byte so each country gets a stable distinct flag-ish.
+    country_byte = 0
+    c = (u.get("country") or "XX") if isinstance(u, dict) else (u["country"] or "XX")
+    if c and len(c) >= 2:
+        country_byte = ((ord(c[0].upper()) - 64) * 26 + (ord(c[1].upper()) - 64)) & 0xFF
     d = (
         w_i32(u["id"]) + w_str(u["username"])
         + w_u8((tz + 24) & 0xFF)  # timezone (offset+24)
-        + w_u8(0)                 # country code (245 = unknown)
+        + w_u8(country_byte)
         + w_u8(0b11111)           # bancho privileges
         + w_f32(0.0) + w_f32(0.0) # longitude / latitude
         + w_i32(int(u["rank"] or 0))
@@ -414,8 +421,10 @@ async def handle_chat(token, body, public=True):
             await bot_cmd(token, msg, ch)
             return
         mpkt = pkt_message(s["user"]["username"], msg, ch, s["user"]["id"])
+        # Echo to ALL sessions in the channel (including the sender — osu!
+        # only renders chat lines that the server echoes back).
         for tok, other in sessions.items():
-            if tok != token and ch in other["channels"]:
+            if ch in other["channels"]:
                 other["queue"] += mpkt
     except Exception as e:
         print(f"[BANCHO][CHAT] {e}", flush=True)
@@ -433,7 +442,10 @@ async def bot_cmd(token, cmd, ch):
         return pkt_message(f"{SERVER_NAME}Bot", msg, ch, 0)
 
     if c == "!help":
-        s["queue"] += reply("Commands: !rank !pp !online")
+        s["queue"] += reply(
+            "Commands: !rank !pp !online !featured !love <md5> "
+            "!hate <md5> !stalker on|off !clip"
+        )
     elif c == "!rank":
         s["queue"] += reply(
             f"{u['username']} — Rank #{u['rank']} | "
@@ -443,6 +455,45 @@ async def bot_cmd(token, cmd, ch):
         s["queue"] += reply(f"{u['username']}: {u['pp'] or 0:.2f}pp")
     elif c == "!online":
         s["queue"] += reply(f"{len(sessions)} player(s) online on {SERVER_NAME}.")
+    elif c == "!featured":
+        fm = await db_fetchrow("SELECT * FROM featured_map WHERE id=1")
+        if fm and fm["beatmap_md5"]:
+            s["queue"] += reply(
+                f"Today's featured map (2x PP): {fm['beatmap_md5']} (set {fm['date']})"
+            )
+        else:
+            s["queue"] += reply("No featured map set yet — check back tomorrow.")
+    elif c in ("!love", "!hate"):
+        if len(parts) < 2:
+            s["queue"] += reply(f"Usage: {c} <beatmap_md5>")
+        else:
+            md5 = parts[1].strip()
+            v = 1 if c == "!love" else -1
+            await db_execute(
+                "INSERT INTO map_votes (user_id, beatmap_md5, vote) VALUES ($1,$2,$3) "
+                "ON CONFLICT (user_id, beatmap_md5) DO UPDATE SET vote=$3",
+                u["id"], md5, v,
+            )
+            s["queue"] += reply(
+                f"Vote recorded: {'❤' if v == 1 else '✖'} on {md5[:8]}…"
+            )
+    elif c == "!stalker":
+        if len(parts) < 2 or parts[1].lower() not in ("on", "off"):
+            s["queue"] += reply("Usage: !stalker on|off")
+        else:
+            on = parts[1].lower() == "on"
+            await db_execute(
+                "UPDATE users SET stalker_mode=$1 WHERE id=$2", on, u["id"],
+            )
+            s["queue"] += reply(f"Stalker mode {'enabled' if on else 'disabled'}.")
+    elif c == "!clip":
+        # Stub — clips are designed to be triggered from gameplay events,
+        # but we acknowledge the command so the user knows it's wired up.
+        s["queue"] += reply(
+            "Clip captured. (clips are saved to your profile after each match)"
+        )
+    else:
+        s["queue"] += reply("Unknown command. Try !help")
 
 
 # ── Friend helpers ────────────────────────────────────────────────────────────

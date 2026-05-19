@@ -1,127 +1,171 @@
 """
 Scythe — Score Submission
-POST /api/osu-submit-modular-selector.php
+POST /web/osu-submit-modular-selector.php
+
+Reads multipart/form-data, AES-decrypts the encrypted `score` field
+(modern osu! stable always encrypts it), parses with correct field
+offsets, runs anti-cheat, and returns post-submission stat deltas.
 """
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from http.server import BaseHTTPRequestHandler
-import json, time, urllib.parse, hashlib, math
+import asyncio
 
 from lib.db import (
-    get_user_by_name, get_or_create_beatmap, submit_score,
+    get_user_by_name, get_user_by_id, get_or_create_beatmap, submit_score,
     flag_score_db, update_user_stats, recalculate_rank,
-    get_featured_map, fetchall, fetchval
+    get_featured_map, fetchall, fetchval, execute,
 )
 from lib.pp import (
-    calculate_pp, calculate_accuracy, get_rank_string, recalculate_user_pp
+    calculate_pp, calculate_accuracy, get_rank_string, recalculate_user_pp,
 )
+from lib.scoresub import parse_multipart, decrypt_score, parse_score_string
 
 
 class handler(BaseHTTPRequestHandler):
 
+    def do_GET(self):
+        self._respond(405, "Method Not Allowed")
+
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length).decode("utf-8", errors="ignore")
-        data = dict(urllib.parse.parse_qsl(body))
-
-        import asyncio
-        result = asyncio.run(self._handle(data))
+        body = self.rfile.read(length)
+        ctype = self.headers.get("Content-Type", "")
+        try:
+            result = asyncio.run(self._handle(ctype, body))
+        except Exception as e:
+            result = f"error: {type(e).__name__}: {e}"
         self._respond(200, result)
-
-    async def _handle(self, data: dict) -> str:
-        score_str = data.get("x", "") or data.get("score", "")
-        parts = score_str.split(":")
-        if len(parts) < 14:
-            return "error: malformed score"
-
-        beatmap_md5 = parts[0].strip()
-        username    = parts[1].strip()
-        count300    = int(parts[2])
-        count100    = int(parts[3])
-        count50     = int(parts[4])
-        countmiss   = int(parts[7])
-        score_val   = int(parts[8])
-        max_combo   = int(parts[9])
-        is_fc       = parts[10] in ("True", "1")
-        mods        = int(parts[12])
-        passed      = parts[13] in ("True", "1")
-
-        user = await get_user_by_name(username)
-        if not user:
-            return "error: user not found"
-
-        beatmap = await get_or_create_beatmap(beatmap_md5)
-        stars    = beatmap["diff_rating"] or 3.0
-        ar       = beatmap["ar"] or 9.0
-        od       = beatmap["od"] or 8.0
-        bmc      = beatmap["max_combo"] or 0
-
-        accuracy = calculate_accuracy(count300, count100, count50, countmiss)
-        rank_str = get_rank_string(accuracy, countmiss, count300, count100, count50, mods)
-
-        fm = await get_featured_map()
-        is_featured = fm and fm["beatmap_md5"] == beatmap_md5
-
-        pp = calculate_pp(
-            stars=stars, accuracy=accuracy,
-            max_combo=max_combo, beatmap_max_combo=bmc,
-            count300=count300, count100=count100,
-            count50=count50, countmiss=countmiss,
-            mods=mods, ar=ar, od=od,
-            is_featured_map=bool(is_featured),
-            hot_streak=user["hot_streak"] or 0
-        ) if passed else 0.0
-
-        score_id = await submit_score(
-            user["id"], beatmap_md5, score_val, pp, accuracy,
-            max_combo, count300, count100, count50, countmiss,
-            mods, rank_str, is_fc, passed
-        )
-
-        # Basic anti-cheat checks
-        flags = []
-        if passed:
-            if bmc > 0 and max_combo > bmc:
-                flags.append(f"combo exceeds max: {max_combo}>{bmc}")
-            if user["pp"] > 0 and pp > user["pp"] * 2.5:
-                flags.append(f"pp spike: {pp:.0f} vs {user['pp']:.0f}")
-            if (user["playcount"] or 0) < 5 and pp > 400:
-                flags.append(f"new acct high pp: {pp:.0f}")
-
-        if flags:
-            await flag_score_db(score_id, "; ".join(flags))
-
-        # Update stats
-        if passed:
-            await _update_stats(user["id"], is_fc, countmiss > 0)
-
-        return _build_response(user, score_id)
 
     def _respond(self, code: int, body: str):
         self.send_response(code)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
-        self.wfile.write(body.encode())
+        self.wfile.write(body.encode("utf-8", "ignore"))
 
-    def do_GET(self):
-        self._respond(405, "Method Not Allowed")
+    async def _handle(self, content_type: str, body: bytes) -> str:
+        fields = parse_multipart(content_type, body)
+
+        # The score field can be either:
+        #   - encrypted (modern osu!): use 'score' (b64) + 'iv' (b64) + 'osuver'
+        #   - raw text (older / unofficial clients): just 'score' or 'x'
+        raw_score: str | None = None
+
+        enc_score = fields.get("score")
+        enc_iv    = fields.get("iv")
+        osuver    = (fields.get("osuver") or b"").decode("utf-8", "ignore").strip()
+
+        if enc_score and enc_iv and osuver:
+            raw_score = decrypt_score(enc_score, enc_iv, osuver)
+
+        if not raw_score:
+            # Try legacy plaintext fallbacks
+            legacy = fields.get("score") or fields.get("x")
+            if legacy:
+                raw_score = legacy.decode("utf-8", "ignore")
+
+        if not raw_score:
+            return "error: missing score data"
+
+        parsed = parse_score_string(raw_score)
+        if not parsed:
+            return "error: malformed score string"
+
+        # Authenticate using the password hash field 'pass' (sent by osu!)
+        pw_hash = (fields.get("pass") or b"").decode("utf-8", "ignore").strip()
+        user = await get_user_by_name(parsed["username"])
+        if not user:
+            return "error: user not found"
+        if pw_hash and user["password_md5"] != pw_hash:
+            return "error: bad credentials"
+
+        # Beatmap (auto-loved so leaderboard shows up no matter what)
+        beatmap = await get_or_create_beatmap(parsed["beatmap_md5"])
+        stars = beatmap["diff_rating"] or 3.0
+        ar    = beatmap["ar"] or 9.0
+        od    = beatmap["od"] or 8.0
+        bmc   = beatmap["max_combo"] or 0
+
+        accuracy = calculate_accuracy(
+            parsed["count300"], parsed["count100"],
+            parsed["count50"], parsed["countmiss"],
+        )
+        rank_str = get_rank_string(
+            accuracy, parsed["countmiss"],
+            parsed["count300"], parsed["count100"], parsed["count50"],
+            parsed["mods"],
+        )
+
+        fm = await get_featured_map()
+        is_featured = bool(fm and fm["beatmap_md5"] == parsed["beatmap_md5"])
+
+        pp = 0.0
+        if parsed["passed"]:
+            pp = calculate_pp(
+                stars=stars, accuracy=accuracy,
+                max_combo=parsed["max_combo"], beatmap_max_combo=bmc,
+                count300=parsed["count300"], count100=parsed["count100"],
+                count50=parsed["count50"], countmiss=parsed["countmiss"],
+                mods=parsed["mods"], ar=ar, od=od,
+                is_featured_map=is_featured,
+                hot_streak=user["hot_streak"] or 0,
+            )
+
+        # Snapshot "before" values BEFORE we run _update_stats
+        before = {
+            "ranked_score": user["ranked_score"] or 0,
+            "total_score":  user["total_score"] or 0,
+            "playcount":    user["playcount"] or 0,
+            "rank":         user["rank"] or 0,
+            "accuracy":     user["accuracy"] or 0.0,
+            "pp":           user["pp"] or 0.0,
+        }
+
+        score_id = await submit_score(
+            user["id"], parsed["beatmap_md5"], parsed["score"], pp, accuracy,
+            parsed["max_combo"],
+            parsed["count300"], parsed["count100"], parsed["count50"], parsed["countmiss"],
+            parsed["mods"], rank_str, parsed["is_fc"], parsed["passed"],
+        )
+
+        # Anti-cheat
+        flags = []
+        if parsed["passed"]:
+            if bmc > 0 and parsed["max_combo"] > bmc:
+                flags.append(f"combo>{bmc}")
+            if before["pp"] > 0 and pp > before["pp"] * 2.5:
+                flags.append(f"pp_spike:{pp:.0f}vs{before['pp']:.0f}")
+            if before["playcount"] < 5 and pp > 400:
+                flags.append(f"new_acct_pp:{pp:.0f}")
+        if flags:
+            await flag_score_db(score_id, "; ".join(flags))
+
+        if parsed["passed"]:
+            await _update_stats(user["id"], parsed["is_fc"], parsed["countmiss"] > 0)
+
+        # Re-fetch fresh stats so the response shows real deltas
+        fresh = await get_user_by_id(user["id"])
+        return _build_response(before, fresh, score_id)
 
 
-def _build_response(user, score_id) -> str:
+def _build_response(before, after, score_id) -> str:
     lines = [
         "beatmapId:0", "beatmapSetId:0",
         "beatmapPlaycount:0", "beatmapPasscount:0", "approvedDate:", "",
         "chartId:overall", "chartName:Overall Ranking", "chartEndDate:",
-        f"beatmapRankingBefore:0", f"beatmapRankingAfter:0",
-        f"rankedScoreBefore:{user['ranked_score']}",
-        f"rankedScoreAfter:{user['ranked_score']}",
-        f"totalScoreBefore:{user['total_score']}",
-        f"totalScoreAfter:{user['total_score']}",
-        f"playCountBefore:{user['playcount']}",
-        f"accuracyBefore:{(user['accuracy'] or 0)*100:.4f}",
-        f"accuracyAfter:{(user['accuracy'] or 0)*100:.4f}",
-        f"rankBefore:{user['rank']}", f"rankAfter:{user['rank']}",
+        "beatmapRankingBefore:0", "beatmapRankingAfter:0",
+        f"rankedScoreBefore:{before['ranked_score']}",
+        f"rankedScoreAfter:{after['ranked_score']}",
+        f"totalScoreBefore:{before['total_score']}",
+        f"totalScoreAfter:{after['total_score']}",
+        f"playCountBefore:{before['playcount']}",
+        f"accuracyBefore:{(before['accuracy'] or 0)*100:.4f}",
+        f"accuracyAfter:{(after['accuracy'] or 0)*100:.4f}",
+        f"rankBefore:{before['rank']}",
+        f"rankAfter:{after['rank']}",
+        f"ppBefore:{before['pp']:.4f}",
+        f"ppAfter:{after['pp']:.4f}",
         "toNextRank:1", "toNextRankUser:",
         "achievements:", "achievements-new:",
         f"onlineScoreId:{score_id}",
@@ -130,25 +174,30 @@ def _build_response(user, score_id) -> str:
 
 
 async def _update_stats(user_id: int, is_fc: bool, had_miss: bool):
-    scores = await fetchall("""
-        SELECT pp, accuracy FROM scores
-        WHERE user_id=$1 AND passed=TRUE ORDER BY pp DESC LIMIT 200
-    """, user_id)
+    scores = await fetchall(
+        "SELECT pp, accuracy FROM scores "
+        "WHERE user_id=$1 AND passed=TRUE ORDER BY pp DESC LIMIT 200",
+        user_id,
+    )
     playcount = await fetchval("SELECT COUNT(*) FROM scores WHERE user_id=$1", user_id)
-    ranked    = await fetchval("SELECT COALESCE(SUM(score),0) FROM scores WHERE user_id=$1 AND passed=TRUE", user_id)
-    total     = await fetchval("SELECT COALESCE(SUM(score),0) FROM scores WHERE user_id=$1", user_id)
-    max_combo = await fetchval("SELECT COALESCE(MAX(max_combo),0) FROM scores WHERE user_id=$1 AND passed=TRUE", user_id)
+    ranked = await fetchval(
+        "SELECT COALESCE(SUM(score),0) FROM scores WHERE user_id=$1 AND passed=TRUE",
+        user_id,
+    )
+    total = await fetchval(
+        "SELECT COALESCE(SUM(score),0) FROM scores WHERE user_id=$1",
+        user_id,
+    )
+    max_combo = await fetchval(
+        "SELECT COALESCE(MAX(max_combo),0) FROM scores WHERE user_id=$1 AND passed=TRUE",
+        user_id,
+    )
 
-    score_list = [dict(s) for s in scores]
-    pp, acc = recalculate_user_pp(score_list)
-
+    pp, acc = recalculate_user_pp([dict(s) for s in scores])
     await update_user_stats(user_id, ranked, total, playcount, pp, acc, max_combo)
     await recalculate_rank(user_id)
 
-    # Hot streak
     if is_fc:
-        from lib.db import execute
         await execute("UPDATE users SET hot_streak=hot_streak+1 WHERE id=$1", user_id)
     elif had_miss:
-        from lib.db import execute
         await execute("UPDATE users SET hot_streak=0 WHERE id=$1", user_id)

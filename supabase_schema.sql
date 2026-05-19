@@ -26,8 +26,16 @@ CREATE TABLE IF NOT EXISTS users (
     clips JSONB DEFAULT '[]',
     stalker_mode BOOLEAN DEFAULT FALSE,
     friends JSONB DEFAULT '[]',
-    country TEXT DEFAULT 'XX'
+    country TEXT DEFAULT 'XX',
+
+    -- per-user avatar URL; if NULL, the avatar handler falls back to a
+    -- DiceBear pixel-art avatar seeded by user id (so every player has a
+    -- unique custom-looking pic the moment they log in).
+    avatar_url TEXT
 );
+
+-- Migration for existing tables (idempotent):
+ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT;
 
 -- ── Scores ────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS scores (
