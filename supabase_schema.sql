@@ -26,8 +26,21 @@ CREATE TABLE IF NOT EXISTS users (
     clips JSONB DEFAULT '[]',
     stalker_mode BOOLEAN DEFAULT FALSE,
     friends JSONB DEFAULT '[]',
-    country TEXT DEFAULT 'XX'
+    country TEXT DEFAULT 'XX',
+
+    -- per-user avatar URL; if NULL, the avatar handler falls back to a
+    -- DiceBear pixel-art avatar seeded by user id (so every player has a
+    -- unique custom-looking pic the moment they log in).
+    avatar_url TEXT,
+
+    -- Etterna-MSD-style skill profile (computed from top plays)
+    -- Format: {"aim": 4.2, "speed": 3.8, "acc": 5.1, "stamina": 3.5, "flashlight": 2.0}
+    skill_profile JSONB DEFAULT '{}'
 );
+
+-- Migration for existing tables (idempotent):
+ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS skill_profile JSONB DEFAULT '{}';
 
 -- ── Scores ────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS scores (
@@ -52,7 +65,10 @@ CREATE TABLE IF NOT EXISTS scores (
     ac_flag_reason TEXT DEFAULT '',
     ac_reviewed BOOLEAN DEFAULT FALSE,
     pp_decayed REAL DEFAULT 0.0,
-    last_decay_check BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())
+    last_decay_check BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()),
+
+    -- TRUE if the player paused during this play
+    paused BOOLEAN DEFAULT FALSE
 );
 
 -- ── Beatmaps ──────────────────────────────────────────────────────────────────
@@ -75,7 +91,11 @@ CREATE TABLE IF NOT EXISTS beatmaps (
     diff_rating REAL DEFAULT 3.0,
     last_update BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()),
     vote_love INTEGER DEFAULT 0,
-    vote_hate INTEGER DEFAULT 0
+    vote_hate INTEGER DEFAULT 0,
+
+    -- Cached per-axis skill demands (computed from metadata heuristics)
+    -- Format: {"aim": 5.2, "speed": 4.1, "acc": 4.8, "stamina": 5.0, "flashlight": 2.5}
+    skillset JSONB
 );
 
 -- ── AC Log ────────────────────────────────────────────────────────────────────
@@ -113,6 +133,55 @@ CREATE INDEX IF NOT EXISTS idx_scores_user ON scores(user_id);
 CREATE INDEX IF NOT EXISTS idx_scores_pp ON scores(pp DESC);
 CREATE INDEX IF NOT EXISTS idx_scores_passed ON scores(passed);
 CREATE INDEX IF NOT EXISTS idx_users_pp ON users(pp DESC);
+
+-- Migration for existing beatmaps table:
+ALTER TABLE beatmaps ADD COLUMN IF NOT EXISTS skillset JSONB;
+ALTER TABLE beatmaps ADD COLUMN IF NOT EXISTS tags TEXT DEFAULT '';
+ALTER TABLE scores ADD COLUMN IF NOT EXISTS paused BOOLEAN DEFAULT FALSE;
+ALTER TABLE scores ADD COLUMN IF NOT EXISTS per_column_acc JSONB;
+ALTER TABLE scores ADD COLUMN IF NOT EXISTS replay_path TEXT;
+
+-- ── Dan Courses ───────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS dan_courses (
+    tier INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    -- Array of beatmap md5 hashes the player must pass in order
+    maps JSONB NOT NULL DEFAULT '[]',
+    -- Minimum accuracy required to pass each map (0-1 scale, e.g. 0.92)
+    min_accuracy REAL DEFAULT 0.90,
+    -- If TRUE, player must not pause during any map in the course
+    no_pause BOOLEAN DEFAULT TRUE,
+    created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())
+);
+
+-- ── Dan Progress (per user per course) ────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS dan_progress (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id),
+    course_tier INTEGER NOT NULL REFERENCES dan_courses(tier),
+    -- Array of md5s the player has completed in this attempt
+    maps_completed JSONB DEFAULT '[]',
+    passed BOOLEAN DEFAULT FALSE,
+    started_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()),
+    completed_at BIGINT,
+    UNIQUE(user_id, course_tier)
+);
+
+-- ── Seed some example Dan courses ─────────────────────────────────────────────
+-- (Admins should replace these md5s with real maps via the admin panel)
+INSERT INTO dan_courses (tier, name, description, maps, min_accuracy) VALUES
+(1, '1st Dan', '4K beginner stream/JS fundamentals', '[]', 0.88),
+(2, '2nd Dan', '4K intermediate streams', '[]', 0.90),
+(3, '3rd Dan', '4K chordjack + handstream', '[]', 0.91),
+(4, '4th Dan', '4K advanced speed + jacks', '[]', 0.92),
+(5, '5th Dan', '4K expert all-rounder', '[]', 0.93),
+(6, '6th Dan', '4K master streams + stamina', '[]', 0.94),
+(7, '7th Dan', '4K high-level tech + speed', '[]', 0.95),
+(8, '8th Dan', '4K elite all patterns', '[]', 0.95),
+(9, '9th Dan', '4K near-Kaiden challenge', '[]', 0.96),
+(10, 'Kaiden', '4K ultimate test — prove your mastery', '[]', 0.96)
+ON CONFLICT (tier) DO NOTHING;
 
 -- ── Default admin user ────────────────────────────────────────────────────────
 -- Password is MD5 of "changeme123" — CHANGE THIS

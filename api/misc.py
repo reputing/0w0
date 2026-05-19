@@ -1,62 +1,102 @@
 """
-Scythe — Misc osu! client endpoints
-Handles all the small endpoints osu! hits on startup / during play.
+Scythe — Misc osu! client endpoints + website API + avatars
+
+Handles:
+  - Tiny stub endpoints osu! pings on startup (bancho_connect, lastfm, ...)
+  - Avatars on a.<domain>/<userid> and /avatar/<userid>
+    Serves a per-user DiceBear pixel-art image so every player has a custom
+    profile picture the moment they connect. Supports user-uploaded URLs
+    via users.avatar_url override.
+  - Public website APIs: /api/v1/leaderboard, /api/v1/online
+  - Public profile JSON at /u/<userid>
+  - Map voting via POST /web/osu-rate.php
 """
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from http.server import BaseHTTPRequestHandler
-import urllib.parse, json, asyncio
+import urllib.parse
+import json
+import asyncio
 
-from lib.db import get_user_by_name, get_featured_map, vote_map
+from lib.db import (
+    get_user_by_name, get_user_by_id, get_avatar_url,
+    fetchall, online_count, vote_map,
+)
+
+
+# Default avatar generator. DiceBear gives a unique deterministic image
+# per-seed with no auth, no rate limit issues for our scale.
+def _default_avatar_url(seed: int | str) -> str:
+    return f"https://api.dicebear.com/9.x/pixel-art/png?seed={seed}&size=256&backgroundType=gradientLinear"
 
 
 class handler(BaseHTTPRequestHandler):
 
+    # ── Routing ────────────────────────────────────────────────────────────
     def do_GET(self):
-        path = urllib.parse.urlparse(self.path).path
-        params = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(self.path).query))
-        body = asyncio.run(self._get(path, params))
-        self._respond(200, body)
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+            params = dict(urllib.parse.parse_qsl(parsed.query))
+            host = (self.headers.get("Host") or "").split(":")[0].lower()
+            asyncio.run(self._dispatch_get(host, path, params))
+        except Exception as e:
+            self._text(500, f"error: {e}")
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(length).decode("utf-8", errors="ignore")
-        data = dict(urllib.parse.parse_qsl(raw))
-        path = urllib.parse.urlparse(self.path).path
-        body = asyncio.run(self._post(path, data))
-        self._respond(200, body)
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length).decode("utf-8", errors="ignore")
+            data = dict(urllib.parse.parse_qsl(raw))
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+            host = (self.headers.get("Host") or "").split(":")[0].lower()
+            asyncio.run(self._dispatch_post(host, path, data))
+        except Exception as e:
+            self._text(500, f"error: {e}")
 
-    async def _get(self, path: str, params: dict) -> str:
-        if "bancho_connect" in path:
-            return "scythe"
-        if "osu-seasonal" in path or "getseasonal" in path:
-            return '["https://i.imgur.com/scythe_bg.jpg"]'
-        if "checktweets" in path:
-            return "0"
-        if "lastfm" in path:
-            return "-3"
-        if "osu-error" in path:
-            return ""
-        if "peppy" in path:
-            return "This is Scythe."
-        if "difficulty-rating" in path:
-            return "0"
-        if "osu-search" in path:
-            return "-1\nUse the osu! website to find maps."
+    # ── GET dispatch ───────────────────────────────────────────────────────
+    async def _dispatch_get(self, host: str, path: str, params: dict):
+        # ── Avatars: a.<domain>/<userid> or /avatar/<userid> ──
+        if host.startswith("a.") or path.startswith("/avatar/"):
+            if path.startswith("/avatar/"):
+                ident = path.split("/avatar/", 1)[1]
+            else:
+                ident = path.lstrip("/")
+            ident = ident.split("/")[0].split(".")[0]  # strip ".jpg" etc
 
-        # Global leaderboard (public JSON)
-        if path.endswith("/api/v1/leaderboard"):
-            from lib.db import fetchall
-            rows = await fetchall("""
+            # Try to resolve user_id
+            url = None
+            if ident.isdigit():
+                custom = await get_avatar_url(int(ident))
+                url = custom or _default_avatar_url(ident)
+            else:
+                url = _default_avatar_url(ident or "default")
+
+            self.send_response(302)
+            self.send_header("Location", url)
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.end_headers()
+            return
+
+        # ── Website APIs ──
+        if path == "/api/v1/online":
+            count = await online_count()
+            self._json({"online": count})
+            return
+
+        if path == "/api/v1/leaderboard":
+            rows = await fetchall(
+                """
                 SELECT id, username, pp, rank, accuracy, playcount,
                        ranked_score, country, status
                 FROM users WHERE status != 1
                 ORDER BY pp DESC LIMIT 50
-            """)
-            result = []
-            for i, r in enumerate(rows):
-                result.append({
+                """
+            )
+            data = [
+                {
                     "rank": i + 1,
                     "id": r["id"],
                     "username": r["username"],
@@ -64,24 +104,19 @@ class handler(BaseHTTPRequestHandler):
                     "accuracy": r["accuracy"],
                     "playcount": r["playcount"],
                     "country": r["country"],
-                })
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(result).encode())
-            return None
+                }
+                for i, r in enumerate(rows)
+            ]
+            self._json(data)
+            return
 
-        # User profile
-        if "/u/" in path:
+        # ── User profile JSON ──
+        if path.startswith("/u/"):
             try:
-                uid = int(path.split("/u/")[1].split("/")[0])
-                from lib.db import get_user_by_id
+                uid = int(path.split("/u/", 1)[1].split("/")[0])
                 user = await get_user_by_id(uid)
                 if user:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({
+                    self._json({
                         "id": user["id"],
                         "username": user["username"],
                         "pp": user["pp"],
@@ -89,33 +124,176 @@ class handler(BaseHTTPRequestHandler):
                         "accuracy": user["accuracy"],
                         "playcount": user["playcount"],
                         "ranked_score": user["ranked_score"],
+                        "total_score": user["total_score"],
+                        "max_combo": user["max_combo"],
                         "hot_streak": user["hot_streak"],
                         "country": user["country"],
-                    }).encode())
-                    return None
+                        "registered_at": user["registered_at"],
+                        "avatar_url": user["avatar_url"] or _default_avatar_url(user["id"]),
+                        "skill_profile": user.get("skill_profile") or {},
+                        "friends": user.get("friends") or [],
+                    })
+                    return
             except Exception:
                 pass
+            self._json({"error": "not_found"}, 404)
+            return
 
-        return ""
+        # ── User scores (recent/top) ──
+        if path.startswith("/api/v1/user/") and "/scores" in path:
+            try:
+                parts_path = path.split("/")
+                uid = int(parts_path[4])  # /api/v1/user/<id>/scores
+                mode = params.get("type", "recent")  # "recent" or "best"
+                limit = min(int(params.get("limit", 20)), 50)
 
-    async def _post(self, path: str, data: dict) -> str:
+                if mode == "best":
+                    rows = await fetchall(
+                        """
+                        SELECT s.*, b.title, b.artist, b.version, b.diff_rating
+                        FROM scores s LEFT JOIN beatmaps b ON b.md5 = s.beatmap_md5
+                        WHERE s.user_id=$1 AND s.passed=TRUE
+                        ORDER BY s.pp DESC LIMIT $2
+                        """,
+                        uid, limit,
+                    )
+                else:
+                    rows = await fetchall(
+                        """
+                        SELECT s.*, b.title, b.artist, b.version, b.diff_rating
+                        FROM scores s LEFT JOIN beatmaps b ON b.md5 = s.beatmap_md5
+                        WHERE s.user_id=$1
+                        ORDER BY s.submitted_at DESC LIMIT $2
+                        """,
+                        uid, limit,
+                    )
+
+                data = []
+                for r in rows:
+                    data.append({
+                        "id": r["id"],
+                        "beatmap_md5": r["beatmap_md5"],
+                        "title": r.get("title") or "Unknown",
+                        "artist": r.get("artist") or "Unknown",
+                        "version": r.get("version") or "",
+                        "diff_rating": r.get("diff_rating") or 0,
+                        "score": r["score"],
+                        "pp": r["pp"],
+                        "accuracy": r["accuracy"],
+                        "max_combo": r["max_combo"],
+                        "mods": r["mods"],
+                        "rank": r["rank"],
+                        "is_fc": r["is_fc"],
+                        "passed": r["passed"],
+                        "paused": r.get("paused") or False,
+                        "submitted_at": r["submitted_at"],
+                    })
+                self._json(data)
+                return
+            except Exception:
+                pass
+            self._json([])
+            return
+
+        # ── User friends list with pp ──
+        if path.startswith("/api/v1/user/") and "/friends" in path:
+            try:
+                parts_path = path.split("/")
+                uid = int(parts_path[4])  # /api/v1/user/<id>/friends
+                user = await get_user_by_id(uid)
+                if not user:
+                    self._json([])
+                    return
+                friends_ids = user.get("friends") or []
+                if isinstance(friends_ids, str):
+                    import json as _json
+                    friends_ids = _json.loads(friends_ids)
+                if not friends_ids:
+                    self._json([])
+                    return
+                # Fetch friend details
+                friends_data = await fetchall(
+                    """
+                    SELECT id, username, pp, rank, accuracy, playcount, country, avatar_url
+                    FROM users WHERE id = ANY($1) AND status != 1
+                    ORDER BY pp DESC
+                    """,
+                    [int(f) for f in friends_ids if str(f).isdigit()],
+                )
+                data = [
+                    {
+                        "id": f["id"],
+                        "username": f["username"],
+                        "pp": f["pp"],
+                        "rank": f["rank"],
+                        "accuracy": f["accuracy"],
+                        "playcount": f["playcount"],
+                        "country": f["country"],
+                        "avatar_url": f["avatar_url"] or _default_avatar_url(f["id"]),
+                    }
+                    for f in friends_data
+                ]
+                self._json(data)
+                return
+            except Exception:
+                pass
+            self._json([])
+            return
+
+        # ── osu! client stub endpoints ──
+        if "bancho_connect" in path:
+            return self._text(200, "scythe")
+        if "osu-seasonal" in path or "getseasonal" in path:
+            return self._text(200, "[]")
+        if "checktweets" in path:
+            return self._text(200, "0")
+        if "lastfm" in path:
+            return self._text(200, "-3")
+        if "osu-error" in path:
+            return self._text(200, "")
+        if "peppy" in path:
+            return self._text(200, "Welcome to Scythe.")
+        if "difficulty-rating" in path:
+            return self._text(200, "0")
+        if "osu-search" in path:
+            return self._text(200, "-1\nUse the osu! website to find maps.")
+        if "check-updates" in path:
+            return self._text(200, "[]")
+
+        self._text(200, "")
+
+    # ── POST dispatch ──────────────────────────────────────────────────────
+    async def _dispatch_post(self, host: str, path: str, data: dict):
         if "getbeatmapinfo" in path:
-            return ""
-        if "vote" in path:
+            return self._text(200, "")
+
+        if "osu-rate" in path or "vote" in path:
             username = data.get("us", "")
             password = data.get("ha", "")
             md5      = data.get("c", "")
-            vote     = int(data.get("v", 0))
+            try:
+                v = int(data.get("v", 0))
+            except (TypeError, ValueError):
+                v = 0
             user = await get_user_by_name(username)
             if user and user["password_md5"] == password and md5:
-                await vote_map(user["id"], md5, vote)
-                return "ok"
-        return ""
+                await vote_map(user["id"], md5, v)
+                return self._text(200, "ok")
+            return self._text(200, "auth fail")
 
-    def _respond(self, code, body):
-        if body is None:
-            return
+        return self._text(200, "")
+
+    # ── Response helpers ───────────────────────────────────────────────────
+    def _text(self, code: int, body: str):
         self.send_response(code)
         self.send_header("Content-Type", "text/plain")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-        self.wfile.write(body.encode())
+        self.wfile.write(body.encode("utf-8", "ignore"))
+
+    def _json(self, obj, code: int = 200):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps(obj).encode("utf-8"))
