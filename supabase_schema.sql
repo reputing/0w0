@@ -137,6 +137,49 @@ CREATE INDEX IF NOT EXISTS idx_users_pp ON users(pp DESC);
 -- Migration for existing beatmaps table:
 ALTER TABLE beatmaps ADD COLUMN IF NOT EXISTS skillset JSONB;
 ALTER TABLE scores ADD COLUMN IF NOT EXISTS paused BOOLEAN DEFAULT FALSE;
+ALTER TABLE scores ADD COLUMN IF NOT EXISTS per_column_acc JSONB;
+
+-- ── Dan Courses ───────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS dan_courses (
+    tier INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    -- Array of beatmap md5 hashes the player must pass in order
+    maps JSONB NOT NULL DEFAULT '[]',
+    -- Minimum accuracy required to pass each map (0-1 scale, e.g. 0.92)
+    min_accuracy REAL DEFAULT 0.90,
+    -- If TRUE, player must not pause during any map in the course
+    no_pause BOOLEAN DEFAULT TRUE,
+    created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())
+);
+
+-- ── Dan Progress (per user per course) ────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS dan_progress (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id),
+    course_tier INTEGER NOT NULL REFERENCES dan_courses(tier),
+    -- Array of md5s the player has completed in this attempt
+    maps_completed JSONB DEFAULT '[]',
+    passed BOOLEAN DEFAULT FALSE,
+    started_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()),
+    completed_at BIGINT,
+    UNIQUE(user_id, course_tier)
+);
+
+-- ── Seed some example Dan courses ─────────────────────────────────────────────
+-- (Admins should replace these md5s with real maps via the admin panel)
+INSERT INTO dan_courses (tier, name, description, maps, min_accuracy) VALUES
+(1, '1st Dan', '4K beginner stream/JS fundamentals', '[]', 0.88),
+(2, '2nd Dan', '4K intermediate streams', '[]', 0.90),
+(3, '3rd Dan', '4K chordjack + handstream', '[]', 0.91),
+(4, '4th Dan', '4K advanced speed + jacks', '[]', 0.92),
+(5, '5th Dan', '4K expert all-rounder', '[]', 0.93),
+(6, '6th Dan', '4K master streams + stamina', '[]', 0.94),
+(7, '7th Dan', '4K high-level tech + speed', '[]', 0.95),
+(8, '8th Dan', '4K elite all patterns', '[]', 0.95),
+(9, '9th Dan', '4K near-Kaiden challenge', '[]', 0.96),
+(10, 'Kaiden', '4K ultimate test — prove your mastery', '[]', 0.96)
+ON CONFLICT (tier) DO NOTHING;
 
 -- ── Default admin user ────────────────────────────────────────────────────────
 -- Password is MD5 of "changeme123" — CHANGE THIS

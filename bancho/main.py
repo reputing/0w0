@@ -292,6 +292,10 @@ async def handle_login(body_bytes: bytes):
         "channels": {"#osu", "#announce"},
         "token":    token,
         "tz":       tz,
+        "session_start":    int(time.time()),
+        "session_plays":    0,
+        "session_pp_start": float(user["pp"] or 0.0),
+        "session_best_pp":  0.0,
     }
 
     try:
@@ -444,7 +448,8 @@ async def bot_cmd(token, cmd, ch):
     if c == "!help":
         s["queue"] += reply(
             "Commands: !rank !pp !online !skill !rec !compare <user> "
-            "!featured !love <md5> !hate <md5> !stalker on|off !clip"
+            "!dan list|start|progress !session !today !fingers "
+            "!featured !love <md5> !hate <md5> !stalker on|off"
         )
     elif c == "!rank":
         s["queue"] += reply(
@@ -564,6 +569,142 @@ async def bot_cmd(token, cmd, ch):
                 s["queue"] += reply(
                     f"vs {target_u['username']}: {' | '.join(lines)}"
                 )
+    elif c == "!dan":
+        # Dan course system: !dan list, !dan start <tier>, !dan progress
+        if len(parts) < 2:
+            s["queue"] += reply("Usage: !dan list | !dan start <tier> | !dan progress")
+        else:
+            sub = parts[1].lower()
+            if sub == "list":
+                courses = await db_fetch(
+                    "SELECT tier, name, description FROM dan_courses ORDER BY tier ASC"
+                )
+                if not courses:
+                    s["queue"] += reply("No dan courses configured yet.")
+                else:
+                    for course in courses[:10]:
+                        s["queue"] += reply(
+                            f"  Dan {course['tier']}: {course['name']} — {course['description']}"
+                        )
+            elif sub == "start":
+                if len(parts) < 3 or not parts[2].isdigit():
+                    s["queue"] += reply("Usage: !dan start <tier_number>")
+                else:
+                    tier = int(parts[2])
+                    course = await db_fetchrow(
+                        "SELECT * FROM dan_courses WHERE tier=$1", tier
+                    )
+                    if not course:
+                        s["queue"] += reply(f"Dan {tier} doesn't exist. Use !dan list")
+                    else:
+                        maps = course["maps"] or []
+                        await db_execute(
+                            """
+                            INSERT INTO dan_progress (user_id, course_tier, maps_completed, started_at)
+                            VALUES ($1, $2, '[]'::jsonb, $3)
+                            ON CONFLICT (user_id, course_tier) DO UPDATE
+                            SET maps_completed='[]'::jsonb, started_at=$3
+                            """,
+                            u["id"], tier, int(time.time()),
+                        )
+                        s["queue"] += reply(
+                            f"Started Dan {tier}: {course['name']}! "
+                            f"Play {len(maps)} maps without pausing. "
+                            f"Maps: {', '.join(m[:8]+'…' for m in maps[:4])}"
+                        )
+            elif sub == "progress":
+                progress = await db_fetch(
+                    "SELECT * FROM dan_progress WHERE user_id=$1 ORDER BY course_tier",
+                    u["id"],
+                )
+                if not progress:
+                    s["queue"] += reply("No dan courses started. Use !dan start <tier>")
+                else:
+                    for p in progress[:5]:
+                        completed = p["maps_completed"] or []
+                        course = await db_fetchrow(
+                            "SELECT maps, name FROM dan_courses WHERE tier=$1",
+                            p["course_tier"],
+                        )
+                        total = len(course["maps"]) if course else 0
+                        status = "PASSED" if p.get("passed") else f"{len(completed)}/{total}"
+                        s["queue"] += reply(
+                            f"  Dan {p['course_tier']}: {status}"
+                            + (f" ({course['name']})" if course else "")
+                        )
+            else:
+                s["queue"] += reply("Usage: !dan list | !dan start <tier> | !dan progress")
+    elif c == "!session":
+        # Session tracking: show current session stats
+        sess = sessions.get(token)
+        if not sess:
+            s["queue"] += reply("No active session.")
+        else:
+            sess_start = sess.get("session_start", 0)
+            sess_plays = sess.get("session_plays", 0)
+            sess_pp_start = sess.get("session_pp_start", 0.0)
+            current_pp = float(u["pp"] or 0.0)
+            pp_gained = current_pp - sess_pp_start
+            duration_min = (int(time.time()) - sess_start) // 60 if sess_start else 0
+            best_play = sess.get("session_best_pp", 0.0)
+            s["queue"] += reply(
+                f"Session: {duration_min}m | {sess_plays} plays | "
+                f"+{pp_gained:.1f}pp | Best: {best_play:.0f}pp"
+            )
+    elif c == "!today":
+        # Today's stats from DB
+        import datetime
+        today_start = int(datetime.datetime.combine(
+            datetime.date.today(), datetime.time.min
+        ).timestamp())
+        today_plays = await db_fetchrow(
+            """
+            SELECT COUNT(*) as cnt,
+                   COALESCE(MAX(pp), 0) as best_pp,
+                   COALESCE(AVG(accuracy), 0) as avg_acc
+            FROM scores WHERE user_id=$1 AND submitted_at >= $2
+            """,
+            u["id"], today_start,
+        )
+        if today_plays:
+            s["queue"] += reply(
+                f"Today: {today_plays['cnt']} plays | "
+                f"Best: {today_plays['best_pp']:.0f}pp | "
+                f"Avg acc: {(today_plays['avg_acc'] or 0)*100:.2f}%"
+            )
+        else:
+            s["queue"] += reply("No plays today yet!")
+    elif c == "!fingers":
+        # Per-key accuracy from recent plays
+        recent = await db_fetch(
+            """
+            SELECT per_column_acc FROM scores
+            WHERE user_id=$1 AND passed=TRUE AND per_column_acc IS NOT NULL
+            ORDER BY submitted_at DESC LIMIT 20
+            """,
+            u["id"],
+        )
+        if not recent:
+            s["queue"] += reply("No per-key data yet. Play some maps first!")
+        else:
+            # Average per-column accuracy across recent plays
+            col_totals: dict[str, list[float]] = {}
+            for row in recent:
+                pca = row["per_column_acc"]
+                if not isinstance(pca, dict):
+                    continue
+                for col, acc in pca.items():
+                    col_totals.setdefault(col, []).append(float(acc))
+            if not col_totals:
+                s["queue"] += reply("No per-key data yet. Play some maps first!")
+            else:
+                # Sort columns numerically
+                sorted_cols = sorted(col_totals.keys(), key=lambda x: int(x) if x.isdigit() else 0)
+                col_strs = []
+                for col in sorted_cols:
+                    avg = sum(col_totals[col]) / len(col_totals[col])
+                    col_strs.append(f"K{int(col)+1}:{avg*100:.1f}%")
+                s["queue"] += reply(f"Per-key acc (last 20): {' | '.join(col_strs)}")
     else:
         s["queue"] += reply("Unknown command. Try !help")
 
