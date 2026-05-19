@@ -443,8 +443,8 @@ async def bot_cmd(token, cmd, ch):
 
     if c == "!help":
         s["queue"] += reply(
-            "Commands: !rank !pp !online !featured !love <md5> "
-            "!hate <md5> !stalker on|off !clip"
+            "Commands: !rank !pp !online !skill !rec !compare <user> "
+            "!featured !love <md5> !hate <md5> !stalker on|off !clip"
         )
     elif c == "!rank":
         s["queue"] += reply(
@@ -492,6 +492,78 @@ async def bot_cmd(token, cmd, ch):
         s["queue"] += reply(
             "Clip captured. (clips are saved to your profile after each match)"
         )
+    elif c == "!skill":
+        profile = u.get("skill_profile") or {}
+        if not profile or all(v == 0 for v in profile.values()):
+            s["queue"] += reply("No skill data yet — play some maps first!")
+        else:
+            from lib.skillset import format_axes_short
+            s["queue"] += reply(f"{u['username']}: {format_axes_short(profile)}")
+    elif c == "!rec":
+        # Recommend a map for the user's weakest skill axis
+        profile = u.get("skill_profile") or {}
+        if not profile or all(v == 0 for v in profile.values()):
+            s["queue"] += reply("Play some maps first so I can learn your skillset!")
+        else:
+            from lib.skillset import score_recommendation, AXES
+            # Find weakest axis
+            weak_axis = min(AXES, key=lambda a: profile.get(a, 0.0))
+            user_level = profile.get(weak_axis, 3.0)
+            target_low = user_level * 1.05
+            target_high = user_level * 1.25
+            # Find maps in the stretch zone for that axis
+            candidates = await db_fetch(
+                "SELECT md5, title, artist, version, diff_rating, skillset "
+                "FROM beatmaps WHERE skillset IS NOT NULL "
+                "ORDER BY diff_rating ASC LIMIT 500"
+            )
+            best = None
+            best_dist = 999.0
+            for bm in candidates:
+                sk = bm["skillset"]
+                if not sk or not isinstance(sk, dict):
+                    continue
+                map_level = sk.get(weak_axis, 0.0)
+                if target_low <= map_level <= target_high:
+                    dist = abs(map_level - (target_low + target_high) / 2)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best = bm
+            if best:
+                s["queue"] += reply(
+                    f"[{weak_axis.upper()} training] Try: "
+                    f"{best['artist']} - {best['title']} [{best['version']}] "
+                    f"({best['diff_rating']:.1f}*)"
+                )
+            else:
+                s["queue"] += reply(
+                    f"No maps found for {weak_axis.upper()} training "
+                    f"({user_level:.1f} → {target_high:.1f}). Play more maps!"
+                )
+    elif c == "!compare":
+        if len(parts) < 2:
+            s["queue"] += reply("Usage: !compare <username>")
+        else:
+            target_name = parts[1].strip()
+            target_safe = target_name.lower().replace(" ", "_")
+            target_u = await db_fetchrow(
+                "SELECT * FROM users WHERE username_safe=$1", target_safe
+            )
+            if not target_u:
+                s["queue"] += reply(f"User '{target_name}' not found.")
+            else:
+                from lib.skillset import compare_profiles, AXES
+                my_prof = u.get("skill_profile") or {a: 0.0 for a in AXES}
+                their_prof = target_u.get("skill_profile") or {a: 0.0 for a in AXES}
+                diff = compare_profiles(my_prof, their_prof)
+                lines = []
+                for axis in AXES:
+                    d = diff[axis]
+                    arrow = "▲" if d > 0 else ("▼" if d < 0 else "=")
+                    lines.append(f"{axis[:3].upper()}:{arrow}{abs(d):.1f}")
+                s["queue"] += reply(
+                    f"vs {target_u['username']}: {' | '.join(lines)}"
+                )
     else:
         s["queue"] += reply("Unknown command. Try !help")
 

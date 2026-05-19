@@ -31,11 +31,16 @@ CREATE TABLE IF NOT EXISTS users (
     -- per-user avatar URL; if NULL, the avatar handler falls back to a
     -- DiceBear pixel-art avatar seeded by user id (so every player has a
     -- unique custom-looking pic the moment they log in).
-    avatar_url TEXT
+    avatar_url TEXT,
+
+    -- Etterna-MSD-style skill profile (computed from top plays)
+    -- Format: {"aim": 4.2, "speed": 3.8, "acc": 5.1, "stamina": 3.5, "flashlight": 2.0}
+    skill_profile JSONB DEFAULT '{}'
 );
 
 -- Migration for existing tables (idempotent):
 ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS skill_profile JSONB DEFAULT '{}';
 
 -- ── Scores ────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS scores (
@@ -83,7 +88,11 @@ CREATE TABLE IF NOT EXISTS beatmaps (
     diff_rating REAL DEFAULT 3.0,
     last_update BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()),
     vote_love INTEGER DEFAULT 0,
-    vote_hate INTEGER DEFAULT 0
+    vote_hate INTEGER DEFAULT 0,
+
+    -- Cached per-axis skill demands (computed from metadata heuristics)
+    -- Format: {"aim": 5.2, "speed": 4.1, "acc": 4.8, "stamina": 5.0, "flashlight": 2.5}
+    skillset JSONB
 );
 
 -- ── AC Log ────────────────────────────────────────────────────────────────────
@@ -121,6 +130,9 @@ CREATE INDEX IF NOT EXISTS idx_scores_user ON scores(user_id);
 CREATE INDEX IF NOT EXISTS idx_scores_pp ON scores(pp DESC);
 CREATE INDEX IF NOT EXISTS idx_scores_passed ON scores(passed);
 CREATE INDEX IF NOT EXISTS idx_users_pp ON users(pp DESC);
+
+-- Migration for existing beatmaps table:
+ALTER TABLE beatmaps ADD COLUMN IF NOT EXISTS skillset JSONB;
 
 -- ── Default admin user ────────────────────────────────────────────────────────
 -- Password is MD5 of "changeme123" — CHANGE THIS

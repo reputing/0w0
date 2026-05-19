@@ -127,6 +127,7 @@ class handler(BaseHTTPRequestHandler):
                         "hot_streak": user["hot_streak"],
                         "country": user["country"],
                         "avatar_url": user["avatar_url"] or _default_avatar_url(user["id"]),
+                        "skill_profile": user.get("skill_profile") or {},
                     })
                     return
             except Exception:

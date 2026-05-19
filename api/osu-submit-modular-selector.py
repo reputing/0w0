@@ -21,6 +21,7 @@ from lib.pp import (
     calculate_pp, calculate_accuracy, get_rank_string, recalculate_user_pp,
 )
 from lib.scoresub import parse_multipart, decrypt_score, parse_score_string
+from lib.skillset import compute_beatmap_skillset, compute_user_profile
 
 
 class handler(BaseHTTPRequestHandler):
@@ -87,6 +88,18 @@ class handler(BaseHTTPRequestHandler):
         od    = beatmap["od"] or 8.0
         bmc   = beatmap["max_combo"] or 0
 
+        # Compute and cache beatmap skillset if not already stored
+        beatmap_skillset = beatmap.get("skillset")
+        if not beatmap_skillset or not isinstance(beatmap_skillset, dict):
+            beatmap_skillset = compute_beatmap_skillset(dict(beatmap))
+            try:
+                await execute(
+                    "UPDATE beatmaps SET skillset=$1::jsonb WHERE md5=$2",
+                    beatmap_skillset, parsed["beatmap_md5"],
+                )
+            except Exception:
+                pass  # non-critical
+
         accuracy = calculate_accuracy(
             parsed["count300"], parsed["count100"],
             parsed["count50"], parsed["countmiss"],
@@ -143,6 +156,8 @@ class handler(BaseHTTPRequestHandler):
 
         if parsed["passed"]:
             await _update_stats(user["id"], parsed["is_fc"], parsed["countmiss"] > 0)
+            # Recalculate user's skill profile from their top plays
+            await _update_skill_profile(user["id"])
 
         # Re-fetch fresh stats so the response shows real deltas
         fresh = await get_user_by_id(user["id"])
@@ -201,3 +216,37 @@ async def _update_stats(user_id: int, is_fc: bool, had_miss: bool):
         await execute("UPDATE users SET hot_streak=hot_streak+1 WHERE id=$1", user_id)
     elif had_miss:
         await execute("UPDATE users SET hot_streak=0 WHERE id=$1", user_id)
+
+
+
+async def _update_skill_profile(user_id: int):
+    """Recompute user skill profile from top 100 passed plays with beatmap skillsets."""
+    try:
+        rows = await fetchall(
+            """
+            SELECT s.accuracy, s.is_fc, s.mods, b.skillset
+            FROM scores s
+            JOIN beatmaps b ON b.md5 = s.beatmap_md5
+            WHERE s.user_id=$1 AND s.passed=TRUE AND b.skillset IS NOT NULL
+            ORDER BY s.pp DESC LIMIT 100
+            """,
+            user_id,
+        )
+        score_data = []
+        for r in rows:
+            sk = r["skillset"]
+            if sk and isinstance(sk, dict):
+                score_data.append({
+                    "accuracy": r["accuracy"],
+                    "is_fc": r["is_fc"],
+                    "mods": r["mods"],
+                    "skillset": sk,
+                })
+        if score_data:
+            profile = compute_user_profile(score_data)
+            await execute(
+                "UPDATE users SET skill_profile=$1::jsonb WHERE id=$2",
+                profile, user_id,
+            )
+    except Exception as e:
+        print(f"[SCORE] skill profile update failed: {e}", flush=True)
