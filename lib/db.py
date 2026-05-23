@@ -250,3 +250,155 @@ async def get_avatar_url(user_id: int) -> str | None:
     if row and row["avatar_url"]:
         return row["avatar_url"]
     return None
+
+
+# ── Web sessions (cookie auth) ────────────────────────────────────────────────
+
+async def create_web_session(user_id: int, token: str, ttl_seconds: int = 30 * 86400,
+                             ip: str = "", user_agent: str = "") -> int:
+    expires = int(time.time()) + ttl_seconds
+    await execute(
+        """
+        INSERT INTO web_sessions (token, user_id, expires_at, ip, user_agent)
+        VALUES ($1, $2, $3, $4, $5)
+        """,
+        token, user_id, expires, ip, user_agent[:500],
+    )
+    return expires
+
+
+async def get_user_by_session(token: str):
+    if not token:
+        return None
+    row = await fetchone(
+        """
+        SELECT u.* FROM web_sessions s
+        JOIN users u ON u.id = s.user_id
+        WHERE s.token = $1 AND s.expires_at > $2
+        """,
+        token, int(time.time()),
+    )
+    return row
+
+
+async def delete_web_session(token: str):
+    if not token:
+        return
+    await execute("DELETE FROM web_sessions WHERE token=$1", token)
+
+
+async def purge_expired_sessions():
+    await execute("DELETE FROM web_sessions WHERE expires_at < $1", int(time.time()))
+
+
+# ── Settings / profile updates ────────────────────────────────────────────────
+
+VALID_COUNTRIES = {
+    "AD","AE","AF","AG","AI","AL","AM","AO","AQ","AR","AS","AT","AU","AW","AX","AZ",
+    "BA","BB","BD","BE","BF","BG","BH","BI","BJ","BL","BM","BN","BO","BQ","BR","BS",
+    "BT","BV","BW","BY","BZ","CA","CC","CD","CF","CG","CH","CI","CK","CL","CM","CN",
+    "CO","CR","CU","CV","CW","CX","CY","CZ","DE","DJ","DK","DM","DO","DZ","EC","EE",
+    "EG","EH","ER","ES","ET","FI","FJ","FK","FM","FO","FR","GA","GB","GD","GE","GF",
+    "GG","GH","GI","GL","GM","GN","GP","GQ","GR","GS","GT","GU","GW","GY","HK","HM",
+    "HN","HR","HT","HU","ID","IE","IL","IM","IN","IO","IQ","IR","IS","IT","JE","JM",
+    "JO","JP","KE","KG","KH","KI","KM","KN","KP","KR","KW","KY","KZ","LA","LB","LC",
+    "LI","LK","LR","LS","LT","LU","LV","LY","MA","MC","MD","ME","MF","MG","MH","MK",
+    "ML","MM","MN","MO","MP","MQ","MR","MS","MT","MU","MV","MW","MX","MY","MZ","NA",
+    "NC","NE","NF","NG","NI","NL","NO","NP","NR","NU","NZ","OM","PA","PE","PF","PG",
+    "PH","PK","PL","PM","PN","PR","PS","PT","PW","PY","QA","RE","RO","RS","RU","RW",
+    "SA","SB","SC","SD","SE","SG","SH","SI","SJ","SK","SL","SM","SN","SO","SR","SS",
+    "ST","SV","SX","SY","SZ","TC","TD","TF","TG","TH","TJ","TK","TL","TM","TN","TO",
+    "TR","TT","TV","TW","TZ","UA","UG","UM","US","UY","UZ","VA","VC","VE","VG","VI",
+    "VN","VU","WF","WS","YE","YT","ZA","ZM","ZW",
+}
+
+
+async def update_user_settings(user_id: int, *, avatar_url=None, banner_url=None,
+                               bio=None, country=None) -> dict:
+    """Patch any subset of profile settings. Returns the updated row."""
+    updates: list[str] = []
+    vals: list = []
+    if avatar_url is not None:
+        updates.append(f"avatar_url=${len(vals)+1}")
+        vals.append(avatar_url[:500] if avatar_url else None)
+    if banner_url is not None:
+        updates.append(f"banner_url=${len(vals)+1}")
+        vals.append(banner_url[:500] if banner_url else None)
+    if bio is not None:
+        updates.append(f"bio=${len(vals)+1}")
+        vals.append(str(bio)[:500])
+    if country is not None:
+        cc = (country or "").strip().upper()
+        if cc and cc in VALID_COUNTRIES:
+            updates.append(f"country=${len(vals)+1}")
+            vals.append(cc)
+    if updates:
+        vals.append(user_id)
+        await execute(
+            f"UPDATE users SET {', '.join(updates)} WHERE id=${len(vals)}",
+            *vals,
+        )
+    row = await get_user_by_id(user_id)
+    return dict(row) if row else {}
+
+
+async def update_user_password(user_id: int, old_password_md5: str,
+                               new_password_md5: str) -> tuple[bool, str | None]:
+    row = await fetchone(
+        "SELECT password_md5 FROM users WHERE id=$1", user_id,
+    )
+    if not row:
+        return False, "user_not_found"
+    if row["password_md5"] != old_password_md5:
+        return False, "bad_password"
+    await execute(
+        "UPDATE users SET password_md5=$1 WHERE id=$2",
+        new_password_md5, user_id,
+    )
+    # Invalidate ALL existing web sessions on password change.
+    await execute("DELETE FROM web_sessions WHERE user_id=$1", user_id)
+    return True, None
+
+
+# ── Friends (web side, used by /me/friends) ───────────────────────────────────
+
+async def add_friend(user_id: int, target_id: int) -> tuple[bool, str | None]:
+    if user_id == target_id:
+        return False, "cannot_friend_self"
+    target = await fetchone("SELECT id FROM users WHERE id=$1", target_id)
+    if not target:
+        return False, "target_not_found"
+    row = await fetchone("SELECT friends FROM users WHERE id=$1", user_id)
+    if not row:
+        return False, "user_not_found"
+    friends = row["friends"] or []
+    if isinstance(friends, str):
+        try:
+            friends = json.loads(friends)
+        except Exception:
+            friends = []
+    friends = [int(f) for f in friends if str(f).isdigit()]
+    if int(target_id) in friends:
+        return True, None  # already a friend, idempotent
+    friends.append(int(target_id))
+    await execute(
+        "UPDATE users SET friends=$1::jsonb WHERE id=$2", friends, user_id,
+    )
+    return True, None
+
+
+async def remove_friend(user_id: int, target_id: int) -> bool:
+    row = await fetchone("SELECT friends FROM users WHERE id=$1", user_id)
+    if not row:
+        return False
+    friends = row["friends"] or []
+    if isinstance(friends, str):
+        try:
+            friends = json.loads(friends)
+        except Exception:
+            friends = []
+    friends = [int(f) for f in friends if str(f).isdigit() and int(f) != int(target_id)]
+    await execute(
+        "UPDATE users SET friends=$1::jsonb WHERE id=$2", friends, user_id,
+    )
+    return True

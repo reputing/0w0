@@ -202,14 +202,61 @@ def pkt_user_stats(u):
     return pkt(P_USER_STATS, d)
 
 
+_OSU_COUNTRY_BYTE = {
+    "XX": 0, "OC": 1, "EU": 2, "AD": 3, "AE": 4, "AF": 5, "AG": 6, "AI": 7,
+    "AL": 8, "AM": 9, "AN": 10, "AO": 11, "AQ": 12, "AR": 13, "AS": 14,
+    "AT": 15, "AU": 16, "AW": 17, "AZ": 18, "BA": 19, "BB": 20, "BD": 21,
+    "BE": 22, "BF": 23, "BG": 24, "BH": 25, "BI": 26, "BJ": 27, "BM": 28,
+    "BN": 29, "BO": 30, "BR": 31, "BS": 32, "BT": 33, "BV": 34, "BW": 35,
+    "BY": 36, "BZ": 37, "CA": 38, "CC": 39, "CD": 40, "CF": 41, "CG": 42,
+    "CH": 43, "CI": 44, "CK": 45, "CL": 46, "CM": 47, "CN": 48, "CO": 49,
+    "CR": 50, "CU": 51, "CV": 52, "CX": 53, "CY": 54, "CZ": 55, "DE": 56,
+    "DJ": 57, "DK": 58, "DM": 59, "DO": 60, "DZ": 61, "EC": 62, "EE": 63,
+    "EG": 64, "EH": 65, "ER": 66, "ES": 67, "ET": 68, "FI": 69, "FJ": 70,
+    "FK": 71, "FM": 72, "FO": 73, "FR": 74, "FX": 75, "GA": 76, "GB": 77,
+    "GD": 78, "GE": 79, "GF": 80, "GH": 81, "GI": 82, "GL": 83, "GM": 84,
+    "GN": 85, "GP": 86, "GQ": 87, "GR": 88, "GS": 89, "GT": 90, "GU": 91,
+    "GW": 92, "GY": 93, "HK": 94, "HM": 95, "HN": 96, "HR": 97, "HT": 98,
+    "HU": 99, "ID": 100, "IE": 101, "IL": 102, "IN": 103, "IO": 104,
+    "IQ": 105, "IR": 106, "IS": 107, "IT": 108, "JM": 109, "JO": 110,
+    "JP": 111, "KE": 112, "KG": 113, "KH": 114, "KI": 115, "KM": 116,
+    "KN": 117, "KP": 118, "KR": 119, "KW": 120, "KY": 121, "KZ": 122,
+    "LA": 123, "LB": 124, "LC": 125, "LI": 126, "LK": 127, "LR": 128,
+    "LS": 129, "LT": 130, "LU": 131, "LV": 132, "LY": 133, "MA": 134,
+    "MC": 135, "MD": 136, "MG": 137, "MH": 138, "MK": 139, "ML": 140,
+    "MM": 141, "MN": 142, "MO": 143, "MP": 144, "MQ": 145, "MR": 146,
+    "MS": 147, "MT": 148, "MU": 149, "MV": 150, "MW": 151, "MX": 152,
+    "MY": 153, "MZ": 154, "NA": 155, "NC": 156, "NE": 157, "NF": 158,
+    "NG": 159, "NI": 160, "NL": 161, "NO": 162, "NP": 163, "NR": 164,
+    "NU": 165, "NZ": 166, "OM": 167, "PA": 168, "PE": 169, "PF": 170,
+    "PG": 171, "PH": 172, "PK": 173, "PL": 174, "PM": 175, "PN": 176,
+    "PR": 177, "PS": 178, "PT": 179, "PW": 180, "PY": 181, "QA": 182,
+    "RE": 183, "RO": 184, "RU": 185, "RW": 186, "SA": 187, "SB": 188,
+    "SC": 189, "SD": 190, "SE": 191, "SG": 192, "SH": 193, "SI": 194,
+    "SJ": 195, "SK": 196, "SL": 197, "SM": 198, "SN": 199, "SO": 200,
+    "SR": 201, "ST": 202, "SV": 203, "SY": 204, "SZ": 205, "TC": 206,
+    "TD": 207, "TF": 208, "TG": 209, "TH": 210, "TJ": 211, "TK": 212,
+    "TM": 213, "TN": 214, "TO": 215, "TL": 216, "TR": 217, "TT": 218,
+    "TV": 219, "TW": 220, "TZ": 221, "UA": 222, "UG": 223, "UM": 224,
+    "US": 225, "UY": 226, "UZ": 227, "VA": 228, "VC": 229, "VE": 230,
+    "VG": 231, "VI": 232, "VN": 233, "VU": 234, "WF": 235, "WS": 236,
+    "YE": 237, "YT": 238, "RS": 239, "ZA": 240, "ZM": 241, "ME": 242,
+    "ZW": 243, "A1": 244, "A2": 245, "AX": 246, "GG": 247, "IM": 248,
+    "JE": 249, "BL": 250, "MF": 251,
+}
+
+
+def country_to_byte(c: str | None) -> int:
+    """Return osu!'s flag byte for an ISO-2 country code; 0 if unknown.
+    Sending an unknown / out-of-range byte crashes the user-panel UI."""
+    if not c:
+        return 0
+    return _OSU_COUNTRY_BYTE.get(c.upper(), 0)
+
+
 def pkt_user_presence(u, tz=0):
-    # Country code byte. osu! uses a country->byte mapping but most clients
-    # accept anything 0-255 as "show generic flag". We hash the country
-    # string to a byte so each country gets a stable distinct flag-ish.
-    country_byte = 0
-    c = (u.get("country") or "XX") if isinstance(u, dict) else (u["country"] or "XX")
-    if c and len(c) >= 2:
-        country_byte = ((ord(c[0].upper()) - 64) * 26 + (ord(c[1].upper()) - 64)) & 0xFF
+    c = (u.get("country") if isinstance(u, dict) else u["country"]) or "XX"
+    country_byte = country_to_byte(c)
     d = (
         w_i32(u["id"]) + w_str(u["username"])
         + w_u8((tz + 24) & 0xFF)  # timezone (offset+24)
@@ -314,7 +361,9 @@ async def handle_login(body_bytes: bytes):
     resp += pkt_login_reply(user["id"])
     resp += pkt_login_perms(1 << 4 if user["status"] == 3 else 1)  # admin or normal
     resp += pkt_notification(f"Welcome to {SERVER_NAME}!")
-    resp += pkt_menu_icon("", f"https://{SERVER_DOMAIN}")
+    # NOTE: pkt_menu_icon with an empty image URL has been observed to
+    # contribute to the user-panel NullReferenceException crash in stable.
+    # Skip it entirely — the client renders fine without a custom menu icon.
     resp += pkt_friends(friends)
     resp += pkt_user_presence(dict(user), tz)
     resp += pkt_user_stats(user)

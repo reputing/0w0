@@ -41,6 +41,21 @@ CREATE TABLE IF NOT EXISTS users (
 -- Migration for existing tables (idempotent):
 ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS skill_profile JSONB DEFAULT '{}';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS banner_url TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT DEFAULT '';
+
+-- ── Web sessions (cookie-based auth for the website) ──────────────────────────
+CREATE TABLE IF NOT EXISTS web_sessions (
+    token TEXT PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()),
+    expires_at BIGINT NOT NULL,
+    ip TEXT DEFAULT '',
+    user_agent TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_web_sessions_user ON web_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_web_sessions_expires ON web_sessions(expires_at);
+ALTER TABLE web_sessions DISABLE ROW LEVEL SECURITY;
 
 -- ── Scores ────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS scores (
