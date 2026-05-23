@@ -153,6 +153,17 @@ P_PROTOCOL_VERSION   = 75
 P_MAIN_MENU_ICON     = 76
 P_USER_PRESENCE      = 83
 P_CHANNEL_INFO_END   = 89
+P_SILENCE_END        = 92
+
+
+# Bancho privilege flags — match the osu! stable enum exactly.
+# Combining PLAYER with anything is fine; SUPPORTER triggers the heart icon
+# and OWNER/DEVELOPER trigger crown icons. Only set those when needed.
+BPRIV_PLAYER     = 1 << 0
+BPRIV_MODERATOR  = 1 << 1
+BPRIV_SUPPORTER  = 1 << 2
+BPRIV_OWNER      = 1 << 3
+BPRIV_DEVELOPER  = 1 << 4
 
 
 # ── Packet builders ───────────────────────────────────────────────────────────
@@ -161,6 +172,7 @@ def pkt_notification(msg):      return pkt(P_NOTIFICATION, w_str(msg))
 def pkt_protocol(v=19):         return pkt(P_PROTOCOL_VERSION, w_i32(v))
 def pkt_pong():                 return pkt(P_PONG)
 def pkt_login_perms(perms):     return pkt(P_LOGIN_PERMISSIONS, w_i32(perms))
+def pkt_silence_end(seconds):   return pkt(P_SILENCE_END, w_i32(int(seconds)))
 def pkt_channel_info_end():     return pkt(P_CHANNEL_INFO_END)
 def pkt_channel_join_ok(name):  return pkt(P_CHANNEL_JOIN_OK, w_str(name))
 def pkt_menu_icon(icon, url):   return pkt(P_MAIN_MENU_ICON, w_str(f"{icon}|{url}"))
@@ -187,17 +199,37 @@ def pkt_friends(ids):
     return pkt(P_FRIENDS_LIST, d)
 
 
+def _safe_float(v, default=0.0):
+    """Float that's never NaN or inf — those break the stable client deserializer."""
+    try:
+        f = float(v if v is not None else default)
+    except (TypeError, ValueError):
+        return float(default)
+    if f != f or f == float("inf") or f == float("-inf"):
+        return float(default)
+    return f
+
+
+def _safe_int(v, default=0):
+    try:
+        return int(v if v is not None else default)
+    except (TypeError, ValueError):
+        return int(default)
+
+
 def pkt_user_stats(u):
-    # action(u8) + info_text(str) + map_md5(str) + mods(u32) + mode(u8) + map_id(i32)
+    # action(u8) + info_text(str) + map_md5(str) + mods(i32) + mode(u8) + map_id(i32)
     status = w_u8(0) + w_str("") + w_str("") + w_u32(0) + w_u8(0) + w_i32(0)
+    acc = max(0.0, min(1.0, _safe_float(u["accuracy"])))   # clamp 0..1
+    pp_i16 = max(0, min(_safe_int(u["pp"]), 32767))
     d = (
-        w_i32(u["id"]) + status
-        + w_i64(int(u["ranked_score"] or 0))
-        + w_f32(float(u["accuracy"] or 0.0))
-        + w_i32(int(u["playcount"] or 0))
-        + w_i64(int(u["total_score"] or 0))
-        + w_i32(int(u["rank"] or 0))
-        + w_i16(min(int(u["pp"] or 0), 32767))
+        w_i32(_safe_int(u["id"])) + status
+        + w_i64(max(0, _safe_int(u["ranked_score"])))
+        + w_f32(acc)
+        + w_i32(max(0, _safe_int(u["playcount"])))
+        + w_i64(max(0, _safe_int(u["total_score"])))
+        + w_i32(max(0, _safe_int(u["rank"])))
+        + w_i16(pp_i16)
     )
     return pkt(P_USER_STATS, d)
 
@@ -254,16 +286,23 @@ def country_to_byte(c: str | None) -> int:
     return _OSU_COUNTRY_BYTE.get(c.upper(), 0)
 
 
-def pkt_user_presence(u, tz=0):
+def pkt_user_presence(u, tz=0, is_admin=False):
     c = (u.get("country") if isinstance(u, dict) else u["country"]) or "XX"
     country_byte = country_to_byte(c)
+    # Bancho privileges low 5 bits | mode (mania=3) << 5.
+    # Sending SUPPORTER/OWNER bits triggers icon renders that NRE ~1s after
+    # GL init while textures are still loading — safer to send just PLAYER
+    # (and DEVELOPER for admins, which doesn't render an icon).
+    priv = BPRIV_PLAYER | (BPRIV_DEVELOPER if is_admin else 0)
+    mode_bits = 3  # osu!mania
+    privs_byte = (priv | (mode_bits << 5)) & 0xFF
     d = (
-        w_i32(u["id"]) + w_str(u["username"])
-        + w_u8((tz + 24) & 0xFF)  # timezone (offset+24)
+        w_i32(_safe_int(u["id"])) + w_str(u["username"] or "")
+        + w_u8((tz + 24) & 0xFF)
         + w_u8(country_byte)
-        + w_u8(0b11111)           # bancho privileges
-        + w_f32(0.0) + w_f32(0.0) # longitude / latitude
-        + w_i32(int(u["rank"] or 0))
+        + w_u8(privs_byte)
+        + w_f32(0.0) + w_f32(0.0)
+        + w_i32(max(0, _safe_int(u["rank"])))
     )
     return pkt(P_USER_PRESENCE, d)
 
@@ -354,19 +393,28 @@ async def handle_login(body_bytes: bytes):
     print(f"[BANCHO] {username} logged in (id={user['id']}, ver={osu_ver}, tz={tz})", flush=True)
 
     friends = coerce_friends(user["friends"])
+    is_admin = (user["status"] == 3)
 
-    # Build login response. Order matters for the osu! client.
+    # Build login response. Order is critical:
+    #
+    #   protocol_version  → handshake
+    #   user_id           → tells client login succeeded; sets LocalUser.Id
+    #   user_presence     → MUST come before login_perms so when UpdatePanel
+    #                       is triggered by login_perms the panel has a name,
+    #                       country, rank etc. to render.
+    #   user_stats        → fills pp / accuracy on the panel
+    #   login_permissions → triggers UpdatePanel — now safe
+    #   silence_end       → some stable builds NPE without it
+    #   notification, friends, channels, menu_icon (skipped — see note above)
     resp = bytearray()
     resp += pkt_protocol(19)
     resp += pkt_login_reply(user["id"])
-    resp += pkt_login_perms(1 << 4 if user["status"] == 3 else 1)  # admin or normal
-    resp += pkt_notification(f"Welcome to {SERVER_NAME}!")
-    # NOTE: pkt_menu_icon with an empty image URL has been observed to
-    # contribute to the user-panel NullReferenceException crash in stable.
-    # Skip it entirely — the client renders fine without a custom menu icon.
-    resp += pkt_friends(friends)
-    resp += pkt_user_presence(dict(user), tz)
+    resp += pkt_user_presence(dict(user), tz, is_admin=is_admin)
     resp += pkt_user_stats(user)
+    resp += pkt_login_perms(BPRIV_PLAYER | (BPRIV_DEVELOPER if is_admin else 0))
+    resp += pkt_silence_end(0)
+    resp += pkt_notification(f"Welcome to {SERVER_NAME}!")
+    resp += pkt_friends(friends)
 
     # Channel listings
     resp += pkt_channel_info("#osu", "Main chat", max(1, len(sessions)))
@@ -378,11 +426,12 @@ async def handle_login(body_bytes: bytes):
     # Send already-online users to the new player
     for tok, s in sessions.items():
         if tok != token:
-            resp += pkt_user_presence(s["user"], s.get("tz", 0))
+            other_admin = (s["user"].get("status") == 3)
+            resp += pkt_user_presence(s["user"], s.get("tz", 0), is_admin=other_admin)
             resp += pkt_user_stats(s["user"])
 
     # Announce new player to everyone else
-    join = pkt_user_presence(dict(user), tz) + pkt_user_stats(user)
+    join = pkt_user_presence(dict(user), tz, is_admin=is_admin) + pkt_user_stats(user)
     broadcast(join, exclude_token=token)
 
     return token, bytes(resp), "ok"
