@@ -4,7 +4,12 @@ POST /users
 
 Accepts:
   - user[username], user[user_email], user[plain_password]
-  - user[country] (optional 2-letter ISO code; auto-detected from IP if missing)
+
+Country is determined automatically — there is no manual override:
+  1. Cloudflare's `cf-ipcountry` header (when CF is in front of Vercel)
+  2. Vercel's `x-vercel-ip-country` header
+  3. ip-api.com fallback (only if both edge headers are missing)
+  4. "XX" (unknown) if all else fails
 """
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -14,31 +19,21 @@ import urllib.parse, json, hashlib, asyncio
 from urllib.request import urlopen, Request
 from urllib.error import URLError
 
-from lib.db import create_user
+from lib.db import create_user, VALID_COUNTRIES
 
 
-VALID_COUNTRIES = {
-    "AD","AE","AF","AG","AI","AL","AM","AO","AQ","AR","AS","AT","AU","AW","AX","AZ",
-    "BA","BB","BD","BE","BF","BG","BH","BI","BJ","BL","BM","BN","BO","BQ","BR","BS",
-    "BT","BV","BW","BY","BZ","CA","CC","CD","CF","CG","CH","CI","CK","CL","CM","CN",
-    "CO","CR","CU","CV","CW","CX","CY","CZ","DE","DJ","DK","DM","DO","DZ","EC","EE",
-    "EG","EH","ER","ES","ET","FI","FJ","FK","FM","FO","FR","GA","GB","GD","GE","GF",
-    "GG","GH","GI","GL","GM","GN","GP","GQ","GR","GS","GT","GU","GW","GY","HK","HM",
-    "HN","HR","HT","HU","ID","IE","IL","IM","IN","IO","IQ","IR","IS","IT","JE","JM",
-    "JO","JP","KE","KG","KH","KI","KM","KN","KP","KR","KW","KY","KZ","LA","LB","LC",
-    "LI","LK","LR","LS","LT","LU","LV","LY","MA","MC","MD","ME","MF","MG","MH","MK",
-    "ML","MM","MN","MO","MP","MQ","MR","MS","MT","MU","MV","MW","MX","MY","MZ","NA",
-    "NC","NE","NF","NG","NI","NL","NO","NP","NR","NU","NZ","OM","PA","PE","PF","PG",
-    "PH","PK","PL","PM","PN","PR","PS","PT","PW","PY","QA","RE","RO","RS","RU","RW",
-    "SA","SB","SC","SD","SE","SG","SH","SI","SJ","SK","SL","SM","SN","SO","SR","SS",
-    "ST","SV","SX","SY","SZ","TC","TD","TF","TG","TH","TJ","TK","TL","TM","TN","TO",
-    "TR","TT","TV","TW","TZ","UA","UG","UM","US","UY","UZ","VA","VC","VE","VG","VI",
-    "VN","VU","WF","WS","YE","YT","ZA","ZM","ZW",
-}
+def detect_country_from_headers(headers) -> str | None:
+    """Read country from Cloudflare/Vercel edge headers. Returns 2-letter code or None."""
+    for h in ("cf-ipcountry", "x-vercel-ip-country"):
+        v = (headers.get(h) or "").strip().upper()
+        # CF returns "XX" for Tor / unknown; treat that as no signal.
+        if v and v != "XX" and v in VALID_COUNTRIES:
+            return v
+    return None
 
 
 def detect_country_from_ip(ip: str) -> str:
-    """Free IP geolocation. Returns 2-letter ISO code or 'XX' on failure."""
+    """Fallback IP geolocation. Returns 2-letter ISO code or 'XX' on failure."""
     if not ip or ip.startswith("127.") or ip.startswith("::1") or ip == "":
         return "XX"
     try:
@@ -68,23 +63,22 @@ class handler(BaseHTTPRequestHandler):
             or self.client_address[0]
         )
 
-        result, code = asyncio.run(self._handle(data, ip))
+        result, code = asyncio.run(self._handle(data, ip, self.headers))
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(json.dumps(result).encode())
 
-    async def _handle(self, data, ip):
+    async def _handle(self, data, ip, headers):
         username = data.get("user[username]", "").strip()
         email    = data.get("user[user_email]", "").strip()
         password = data.get("user[plain_password]", "").strip()
-        country  = (data.get("user[country]", "") or "").strip().upper()
 
         errors = {}
         if not username or len(username) < 2:
             errors["username"] = ["Username too short (min 2)"]
-        if len(username) > 15:
+        elif len(username) > 15:
             errors["username"] = ["Username too long (max 15)"]
         if not email or "@" not in email:
             errors["email"] = ["Invalid email"]
@@ -93,10 +87,9 @@ class handler(BaseHTTPRequestHandler):
         if errors:
             return {"form_error": {"user": errors}}, 400
 
-        # Validate country override or auto-detect from IP
-        if country and country in VALID_COUNTRIES:
-            final_country = country
-        else:
+        # Country is 100% auto-detected; user input is ignored.
+        final_country = detect_country_from_headers(headers)
+        if not final_country:
             loop = asyncio.get_event_loop()
             final_country = await loop.run_in_executor(None, detect_country_from_ip, ip)
 
