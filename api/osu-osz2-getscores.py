@@ -30,7 +30,10 @@ class handler(BaseHTTPRequestHandler):
         try:
             result = asyncio.run(self._handle(params))
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             result = f"-1\nServer error: {e}"
+        print(f"[GETSCORES] md5={params.get('c','?')[:8]} user={params.get('us','?')} → {len(result)} bytes, first_line={result.split(chr(10))[0]}", flush=True)
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()

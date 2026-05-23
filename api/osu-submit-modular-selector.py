@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from http.server import BaseHTTPRequestHandler
 import asyncio
+import time
 
 from lib.db import (
     get_user_by_name, get_user_by_id, get_or_create_beatmap, submit_score,
@@ -37,7 +38,10 @@ class handler(BaseHTTPRequestHandler):
         try:
             result = asyncio.run(self._handle(ctype, body))
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             result = f"error: {type(e).__name__}: {e}"
+        print(f"[SCORE-SUB] response: {result[:200]}", flush=True)
         self._respond(200, result)
 
     def _respond(self, code: int, body: str):
