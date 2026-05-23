@@ -890,6 +890,86 @@ async def health_handler(request: web.Request):
     return web.Response(text=body, content_type="text/plain")
 
 
+# ── Integrated Web API handlers (so bancho serves /web/* locally) ─────────────
+# This means you DON'T need a separate Vercel/web server running for
+# score submission and leaderboard to work when testing on your PC.
+
+async def web_getscores_handler(request: web.Request):
+    """GET /web/osu-osz2-getscores.php — leaderboard for a beatmap."""
+    import urllib.parse as _up
+    params = dict(_up.parse_qsl(_up.urlparse(str(request.url)).query))
+    try:
+        from api import _getscores
+        result = await _getscores(params)
+    except Exception as e:
+        traceback.print_exc()
+        result = f"-1\nServer error: {e}"
+    print(f"[GETSCORES] md5={params.get('c','?')[:8]} user={params.get('us','?')} → first_line={result.split(chr(10))[0]}", flush=True)
+    return web.Response(text=result, content_type="text/plain")
+
+
+async def web_submit_handler(request: web.Request):
+    """POST /web/osu-submit-modular-selector.php — score submission."""
+    body = await request.read()
+    ctype = request.headers.get("Content-Type", "")
+    try:
+        from api import _submit_score
+        result = await _submit_score(ctype, body)
+    except Exception as e:
+        traceback.print_exc()
+        result = f"error: {type(e).__name__}: {e}"
+    print(f"[SCORE-SUB] response: {result[:120]}", flush=True)
+    return web.Response(text=result, content_type="text/plain")
+
+
+async def web_getbeatmapinfo_handler(request: web.Request):
+    """POST /web/osu-getbeatmapinfo.php — stub."""
+    return web.Response(text="", content_type="text/plain")
+
+
+async def web_stub_handler(request: web.Request):
+    """Catch-all for misc osu! web endpoints that need a 200 response."""
+    path = request.path
+    if "bancho_connect" in path:
+        return web.Response(text="scythe", content_type="text/plain")
+    if "osu-seasonal" in path or "getseasonal" in path:
+        return web.Response(text="[]", content_type="text/plain")
+    if "checktweets" in path:
+        return web.Response(text="0", content_type="text/plain")
+    if "lastfm" in path:
+        return web.Response(text="-3", content_type="text/plain")
+    if "osu-error" in path:
+        return web.Response(text="", content_type="text/plain")
+    if "difficulty-rating" in path:
+        return web.Response(text="0", content_type="text/plain")
+    if "osu-search" in path:
+        return web.Response(text="-1\nUse the osu! website to find maps.", content_type="text/plain")
+    if "check-updates" in path:
+        return web.Response(text="[]", content_type="text/plain")
+    if "osu-markasread" in path:
+        return web.Response(text="", content_type="text/plain")
+    if "osu-getfriends" in path:
+        return web.Response(text="", content_type="text/plain")
+    if "osu-rate" in path:
+        return web.Response(text="", content_type="text/plain")
+    return web.Response(text="", content_type="text/plain")
+
+
+async def avatar_handler(request: web.Request):
+    """GET /3 or /<userid> on a.0w0.fit — redirect to DiceBear or custom avatar."""
+    ident = request.match_info.get("uid", "0")
+    ident = ident.split(".")[0]  # strip .jpg/.png etc
+    url = f"https://api.dicebear.com/9.x/pixel-art/png?seed={ident}&size=256&backgroundType=gradientLinear"
+    if ident.isdigit():
+        try:
+            row = await db_fetchrow("SELECT avatar_url FROM users WHERE id=$1", int(ident))
+            if row and row["avatar_url"]:
+                url = row["avatar_url"]
+        except Exception:
+            pass
+    raise web.HTTPFound(location=url)
+
+
 # ── Background tasks ──────────────────────────────────────────────────────────
 async def background_tasks():
     import datetime
@@ -944,6 +1024,16 @@ async def main():
     app = web.Application(client_max_size=10 * 1024 * 1024)
     app.router.add_post("/", bancho_handler)
     app.router.add_get("/", health_handler)
+
+    # ── Web API routes (so osu! score sub + leaderboard work locally) ─────
+    app.router.add_get("/web/osu-osz2-getscores.php", web_getscores_handler)
+    app.router.add_post("/web/osu-submit-modular-selector.php", web_submit_handler)
+    app.router.add_post("/web/osu-getbeatmapinfo.php", web_getbeatmapinfo_handler)
+    # Catch-all stubs for misc /web/* endpoints osu! pings
+    app.router.add_get("/web/{tail:.*}", web_stub_handler)
+    app.router.add_post("/web/{tail:.*}", web_stub_handler)
+    # Avatar handler (a.0w0.fit/<uid>)
+    app.router.add_get("/{uid}", avatar_handler)
 
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
