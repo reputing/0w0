@@ -899,7 +899,7 @@ async def web_getscores_handler(request: web.Request):
     import urllib.parse as _up
     params = dict(_up.parse_qsl(_up.urlparse(str(request.url)).query))
     try:
-        from api import _getscores
+        from lib.web_handlers import _getscores
         result = await _getscores(params)
     except Exception as e:
         traceback.print_exc()
@@ -913,7 +913,7 @@ async def web_submit_handler(request: web.Request):
     body = await request.read()
     ctype = request.headers.get("Content-Type", "")
     try:
-        from api import _submit_score
+        from lib.web_handlers import _submit_score
         result = await _submit_score(ctype, body)
     except Exception as e:
         traceback.print_exc()
